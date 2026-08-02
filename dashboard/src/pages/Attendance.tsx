@@ -14,6 +14,7 @@ import {
 } from "../lib/format";
 import type { Attendance } from "../lib/types";
 import { SectionHeader } from "../components/SectionHeader";
+import { StatusChip } from "../components/StatusChip";
 import { Button } from "../components/Button";
 import { EmptyState } from "../components/EmptyState";
 import { SkeletonList } from "../components/Skeleton";
@@ -94,9 +95,7 @@ function FlagCard({
 
       <div className="flag-row">
         {(row.flags ?? []).map((f) => (
-          <span key={f} className="chip flag">
-            {f}
-          </span>
+          <StatusChip key={f} kind="flag" label={f.replace("_", " ")} />
         ))}
         <span className="muted tnum" style={{ fontSize: "0.85rem" }}>
           In {formatDateTime(row.check_in_at)} · Out{" "}
@@ -254,13 +253,13 @@ export function AttendancePage() {
                     </td>
                     <td>
                       {r.review_status === "pending" ? (
-                        <span className="chip flag">flagged</span>
+                        <StatusChip kind="flag" label="flagged" />
                       ) : r.review_status === "cleared" ? (
-                        <span className="chip ok">cleared</span>
+                        <StatusChip kind="neutral" label="cleared" />
                       ) : r.check_out_at ? (
-                        <span className="chip ok">complete</span>
+                        <StatusChip kind="ok" label="complete" />
                       ) : (
-                        <span className="chip warn">open</span>
+                        <StatusChip kind="info" label="on site" pulse />
                       )}
                     </td>
                   </tr>

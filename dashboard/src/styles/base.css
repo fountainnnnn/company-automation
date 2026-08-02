@@ -509,6 +509,108 @@ textarea.input {
   color: #1d4ed8;
 }
 
+/* ---------- status chips: dot + label, one visual language for state ---------- */
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  padding: 4px 12px 4px 9px;
+  border-radius: var(--r-pill);
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+  box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 18%, transparent);
+}
+.status-dot.pulse {
+  animation: status-pulse 2.2s var(--ease) infinite;
+}
+@keyframes status-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 18%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 6px color-mix(in srgb, currentColor 10%, transparent);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .status-dot.pulse {
+    animation: none;
+  }
+}
+.status-chip.ok {
+  background: rgba(22, 163, 74, 0.1);
+  border-color: rgba(22, 163, 74, 0.25);
+  color: #15803d;
+}
+.status-chip.warn {
+  background: rgba(217, 119, 6, 0.12);
+  border-color: rgba(217, 119, 6, 0.28);
+  color: #8a5306;
+}
+.status-chip.flag {
+  background: rgba(220, 38, 38, 0.09);
+  border-color: rgba(220, 38, 38, 0.28);
+  color: #b91c1c;
+}
+.status-chip.info {
+  background: rgba(37, 99, 235, 0.1);
+  border-color: rgba(37, 99, 235, 0.25);
+  color: #1d4ed8;
+}
+.status-chip.neutral {
+  background: rgba(28, 25, 23, 0.05);
+  border-color: var(--hairline);
+  color: var(--ink-2);
+}
+
+/* ---------- admin gate (staff hitting an admin URL) ---------- */
+.admin-gate {
+  max-width: 460px;
+  margin: 12vh auto 0;
+  padding: var(--s-6);
+  text-align: center;
+  background: var(--card);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-panel);
+}
+.admin-gate .lock {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 52px;
+  height: 52px;
+  margin-bottom: var(--s-3);
+  border-radius: 50%;
+  font-size: 1.4rem;
+  background:
+    radial-gradient(circle at 50% 0%, rgba(245, 158, 11, 0.18) 0%, rgba(56, 189, 248, 0.1) 40%, #fff 75%);
+  border: 1px solid var(--hairline);
+}
+.admin-gate h2 {
+  font-size: 1.35rem;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  margin-bottom: var(--s-2);
+}
+.admin-gate p {
+  color: var(--ink-2);
+  font-size: 0.95rem;
+  line-height: 1.55;
+  margin-bottom: var(--s-4);
+}
+
 /* ---------- toolbar / filter bar ---------- */
 .toolbar {
   display: flex;
@@ -1079,8 +1181,22 @@ table.data tbody tr:hover {
   margin-left: auto;
 }
 .sub-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
   margin: var(--s-6) 0 var(--s-3);
   font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+/* amber tick anchors section starts without competing with the eyebrow */
+.sub-head::before {
+  content: "";
+  width: 4px;
+  height: 1.05em;
+  border-radius: 2px;
+  background: linear-gradient(180deg, var(--amber), rgba(245, 158, 11, 0.35));
+  flex: none;
 }
 
 /* ---------- login ---------- */

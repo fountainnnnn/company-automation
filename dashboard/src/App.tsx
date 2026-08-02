@@ -1,5 +1,5 @@
 import { lazy } from "react";
-import { BrowserRouter, Navigate, Route, Routes, useLocation } from "react-router-dom";
+import { BrowserRouter, Link, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import type { ReactNode } from "react";
 import { AuthProvider, useAuth } from "./lib/auth";
 import { ToastProvider } from "./components/Toast";
@@ -49,8 +49,28 @@ function RequireAuth({ children }: { children: ReactNode }) {
 function RequireAdmin({ children }: { children: ReactNode }) {
   const { profile, loading } = useAuth();
   if (loading) return <Booting />;
-  if (profile?.role !== "admin") return <Navigate to="/" replace />;
+  if (profile?.role !== "admin") return <AdminGate />;
   return <>{children}</>;
+}
+
+/** Staff hitting an admin URL get an explanation, not a silent bounce. */
+function AdminGate() {
+  return (
+    <div className="admin-gate reveal">
+      <span className="lock" aria-hidden="true">
+        🔒
+      </span>
+      <h2>Admin access required.</h2>
+      <p>
+        You're signed in as staff, so this area is off limits — attendance,
+        worker approvals and settings are admin-only. Ask an administrator if
+        you need something from here.
+      </p>
+      <Link className="btn btn-primary" to="/">
+        Back to projects
+      </Link>
+    </div>
+  );
 }
 
 export default function App() {

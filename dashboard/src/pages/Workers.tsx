@@ -7,6 +7,7 @@ import { Button } from "../components/Button";
 import { ConfirmDialog, Modal } from "../components/Modal";
 import { EmptyState } from "../components/EmptyState";
 import { SkeletonList } from "../components/Skeleton";
+import { StatusChip } from "../components/StatusChip";
 import { useToast } from "../components/Toast";
 
 interface AssignState {
@@ -234,9 +235,10 @@ export function WorkersPage() {
                     </td>
                     <td>{def ? def.code : "—"}</td>
                     <td>
-                      <span className={`chip ${w.status === "active" ? "ok" : "warn"}`}>
-                        {w.status}
-                      </span>
+                      <StatusChip
+                        kind={w.status === "active" ? "ok" : w.status === "pending" ? "warn" : "neutral"}
+                        label={w.status}
+                      />
                     </td>
                     <td>
                       <div className="cell-actions">

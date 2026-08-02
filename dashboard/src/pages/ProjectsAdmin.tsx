@@ -7,6 +7,7 @@ import { EmptyState } from "../components/EmptyState";
 import { SkeletonList } from "../components/Skeleton";
 import { ConfirmDialog } from "../components/Modal";
 import { ProjectCreateModal } from "../components/ProjectCreateModal";
+import { StatusChip } from "../components/StatusChip";
 import { useToast } from "../components/Toast";
 
 type EditableField = "code" | "name" | "site_address";
@@ -129,9 +130,10 @@ export function ProjectsAdminPage() {
                       : "—"}
                   </td>
                   <td>
-                    <span className={`chip ${p.status === "active" ? "ok" : ""}`.trim()}>
-                      {p.status}
-                    </span>
+                    <StatusChip
+                      kind={p.status === "active" ? "ok" : "neutral"}
+                      label={p.status}
+                    />
                   </td>
                   <td>
                     <div className="cell-actions">
