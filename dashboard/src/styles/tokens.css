@@ -1,0 +1,62 @@
+:root {
+  /* Palette — construction brand, warm neutrals */
+  --surface: #f7f6f3;
+  --card: #ffffff;
+  --ink: #1c1917;
+  --ink-2: #78716c;
+  --hairline: rgba(28, 25, 23, 0.08);
+  --hairline-strong: rgba(28, 25, 23, 0.14);
+
+  --amber: #f59e0b;
+  --amber-deep: #b45309;
+  --sky: #38bdf8;
+  --violet: #8b5cf6;
+
+  --ok: #16a34a;
+  --warn: #d97706;
+  --flag: #dc2626;
+  --info: #2563eb;
+
+  /* Tints */
+  --amber-tint: rgba(245, 158, 11, 0.12);
+  --flag-tint: rgba(220, 38, 38, 0.06);
+  --flag-line: rgba(220, 38, 38, 0.22);
+
+  /* Radii */
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 16px;
+  --r-xl: 20px;
+  --r-pill: 999px;
+
+  /* Shadows */
+  --shadow-panel: 0 10px 30px -10px rgba(28, 25, 23, 0.12);
+  --shadow-float: 0 1px 2px rgba(28, 25, 23, 0.06), 0 12px 34px -14px rgba(28, 25, 23, 0.22);
+  --shadow-btn: 0 1px 2px rgba(28, 25, 23, 0.18), 0 8px 24px rgba(245, 158, 11, 0.28);
+  --shadow-lift: 0 2px 4px rgba(28, 25, 23, 0.18), 0 14px 32px rgba(245, 158, 11, 0.32);
+
+  /* Spacing scale */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 24px;
+  --s-6: 32px;
+  --s-7: 48px;
+  --s-8: 72px;
+
+  /* Type */
+  --font: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  /* Motion */
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --t-fast: 150ms;
+  --t-mid: 200ms;
+  --t-slow: 600ms;
+
+  /* Layout */
+  --topbar-h: 60px;
+  --page-max: 1200px;
+}
