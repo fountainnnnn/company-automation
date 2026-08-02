@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { supabase } from "../lib/supabase";
 import { useAuth } from "../lib/auth";
@@ -9,6 +9,7 @@ import {
   groupByDate,
   mediaOf,
   PAGE_SIZE,
+  REPORT_SELECT,
   signReportMedia,
   visibleReports,
 } from "../lib/reports";
@@ -31,13 +32,23 @@ export function GalleryPage() {
   const [project, setProject] = useState<Project | null>(null);
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
-  const query = useDebounced(filters, 300);
+  // Media type is filtered client-side, so it must not re-key the server query
+  // — toggling it would otherwise throw away every page already loaded.
+  const serverFilters = useMemo<Filters>(
+    () => ({ ...filters, mediaType: "" }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filters.from, filters.to, filters.workerId, filters.query, filters.projectId],
+  );
+  const query = useDebounced(serverFilters, 300);
   const [reports, setReports] = useState<Report[] | null>(null);
   const [urls, setUrls] = useState<Record<string, string>>({});
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [fresh, setFresh] = useState<Set<string>>(new Set());
   const reportIds = useRef<Set<string>>(new Set());
+  // Rows actually fetched from the server. reports.length drifts from this as
+  // realtime prepends arrive, and paging off it would skip rows.
+  const serverOffset = useRef(0);
 
   useEffect(() => {
     let active = true;
@@ -65,6 +76,7 @@ export function GalleryPage() {
     const page = await fetchReports(query, id, 0);
     if (page.error) toast.error(page.error);
     reportIds.current = new Set(page.rows.map((r) => r.id));
+    serverOffset.current = page.rows.length;
     setReports(page.rows);
     setHasMore(page.hasMore);
     void mergeUrls(page.rows);
@@ -77,12 +89,13 @@ export function GalleryPage() {
   async function loadMore() {
     if (!reports) return;
     setLoadingMore(true);
-    const page = await fetchReports(query, id, reports.length);
+    const page = await fetchReports(query, id, serverOffset.current);
     setLoadingMore(false);
     if (page.error) {
       toast.error(page.error);
       return;
     }
+    serverOffset.current += page.rows.length;
     const added = page.rows.filter((r) => !reportIds.current.has(r.id));
     for (const r of added) reportIds.current.add(r.id);
     setReports((prev) => [...(prev ?? []), ...added]);
@@ -111,6 +124,22 @@ export function GalleryPage() {
     [mergeUrls],
   );
 
+  // A ten-photo album arrives as ten INSERTs on the same report. Collect the
+  // ids and refetch once per burst instead of once per row.
+  const pendingMedia = useRef<Set<string>>(new Set());
+  const flushTimer = useRef<number | null>(null);
+
+  const flushMedia = useCallback(() => {
+    flushTimer.current = null;
+    const ids = Array.from(pendingMedia.current);
+    pendingMedia.current.clear();
+    if (ids.length === 0) return;
+    void (async () => {
+      const { data } = await supabase.from("reports").select(REPORT_SELECT).in("id", ids);
+      for (const row of (data ?? []) as unknown as Report[]) upsertReport(row, false);
+    })();
+  }, [upsertReport]);
+
   // Realtime: new reports for this project, and media landing on loaded reports.
   useEffect(() => {
     if (!id) return;
@@ -137,21 +166,32 @@ export function GalleryPage() {
         (payload) => {
           const row = payload.new as { report_id: string };
           if (!reportIds.current.has(row.report_id)) return;
-          void fetchReportById(row.report_id).then((full) => {
-            if (full) upsertReport(full, false);
-          });
+          pendingMedia.current.add(row.report_id);
+          if (flushTimer.current === null) {
+            flushTimer.current = window.setTimeout(flushMedia, 300);
+          }
         },
       )
       .subscribe();
 
     return () => {
+      if (flushTimer.current !== null) {
+        window.clearTimeout(flushTimer.current);
+        flushTimer.current = null;
+      }
+      pendingMedia.current.clear();
       void supabase.removeChannel(channel);
     };
-  }, [id, upsertReport]);
+  }, [id, upsertReport, flushMedia]);
 
-  const shown = reports ? visibleReports(reports, filters.mediaType) : [];
-  const groups = groupByDate(shown);
-  const mediaTotal = shown.reduce((n, r) => n + mediaOf(r, filters.mediaType).length, 0);
+  const { shown, groups, mediaTotal } = useMemo(() => {
+    const list = reports ? visibleReports(reports, filters.mediaType) : [];
+    return {
+      shown: list,
+      groups: groupByDate(list),
+      mediaTotal: list.reduce((n, r) => n + mediaOf(r, filters.mediaType).length, 0),
+    };
+  }, [reports, filters.mediaType]);
 
   return (
     <div className="reveal">

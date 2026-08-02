@@ -8,7 +8,9 @@ import {
   formatDuration,
   formatTime,
   mapsUrl,
+  sgtDayRange,
   toDateInput,
+  toSgtDay,
 } from "../lib/format";
 import type { Attendance } from "../lib/types";
 import { SectionHeader } from "../components/SectionHeader";
@@ -84,7 +86,7 @@ function FlagCard({
             {row.projects.code}
           </span>
         )}
-        <span className="chip tnum">{formatDay(row.check_in_at.slice(0, 10))}</span>
+        <span className="chip tnum">{formatDay(toSgtDay(row.check_in_at))}</span>
         {row.distance_m !== null && (
           <span className="dist-badge tnum">{formatDistance(row.distance_m)}</span>
         )}
@@ -151,13 +153,12 @@ export function AttendancePage() {
 
   const loadDay = useCallback(async () => {
     setRows(null);
-    const start = new Date(`${day}T00:00:00`);
-    const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+    const { start, end } = sgtDayRange(day);
     const { data, error } = await supabase
       .from("attendance")
       .select(SELECT)
-      .gte("check_in_at", start.toISOString())
-      .lt("check_in_at", end.toISOString())
+      .gte("check_in_at", start)
+      .lt("check_in_at", end)
       .order("check_in_at", { ascending: true });
     if (error) toast.error(error.message);
     setRows((data ?? []) as unknown as Attendance[]);

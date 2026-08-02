@@ -5,6 +5,7 @@ import { SectionHeader } from "../components/SectionHeader";
 import { Button } from "../components/Button";
 import { EmptyState } from "../components/EmptyState";
 import { SkeletonList } from "../components/Skeleton";
+import { ConfirmDialog } from "../components/Modal";
 import { ProjectCreateModal } from "../components/ProjectCreateModal";
 import { useToast } from "../components/Toast";
 
@@ -14,6 +15,8 @@ export function ProjectsAdminPage() {
   const toast = useToast();
   const [projects, setProjects] = useState<Project[] | null>(null);
   const [creating, setCreating] = useState(false);
+  const [archiving, setArchiving] = useState<Project | null>(null);
+  const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
     const { data, error } = await supabase.from("projects").select("*").order("code");
@@ -133,12 +136,7 @@ export function ProjectsAdminPage() {
                   <td>
                     <div className="cell-actions">
                       {p.status === "active" ? (
-                        <Button
-                          variant="danger"
-                          onClick={() =>
-                            void patch(p.id, { status: "archived" }, "Project archived.")
-                          }
-                        >
+                        <Button variant="danger" onClick={() => setArchiving(p)}>
                           Archive
                         </Button>
                       ) : (
@@ -158,6 +156,24 @@ export function ProjectsAdminPage() {
             </tbody>
           </table>
         </div>
+      )}
+
+      {archiving && (
+        <ConfirmDialog
+          title="Archive this project?"
+          message={`${archiving.code} · ${archiving.name} will disappear from the bot's keyboards and from the active projects list. Its records stay, and you can unarchive it later.`}
+          confirmLabel="Archive project"
+          busy={busy}
+          onConfirm={() => {
+            const project = archiving;
+            setBusy(true);
+            void patch(project.id, { status: "archived" }, "Project archived.").finally(() => {
+              setBusy(false);
+              setArchiving(null);
+            });
+          }}
+          onClose={() => setArchiving(null)}
+        />
       )}
 
       {creating && (

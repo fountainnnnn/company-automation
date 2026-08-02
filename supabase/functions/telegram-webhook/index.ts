@@ -54,7 +54,7 @@ interface TgLocation {
 interface TgMessage {
   message_id: number;
   from?: TgUser;
-  chat: { id: number };
+  chat: { id: number; type?: string };
   text?: string;
   caption?: string;
   location?: TgLocation;
@@ -107,9 +107,10 @@ interface Attendance {
   check_in_at: string;
   in_lat: number;
   in_lng: number;
+  flags: string[];
 }
 
-/** Media pending a project choice, kept in chat_sessions.draft. */
+/** Media descriptor; pending items are persisted in the pending_media table. */
 interface MediaDescriptor {
   media_type: "photo" | "video" | "document";
   telegram_file_id: string;
@@ -118,15 +119,14 @@ interface MediaDescriptor {
   width: number | null;
   height: number | null;
   media_group_id: string | null;
+  file_name: string | null;
   ext: string;
 }
 
 interface Draft {
   project_id?: number;
   report_id?: number;
-  pending_media?: MediaDescriptor[];
   pending_group?: string | null;
-  pending_caption?: string | null;
 }
 
 type SessionState =
@@ -155,6 +155,9 @@ interface InlineButton {
 interface Config {
   botToken: string;
   webhookSecret: string;
+}
+
+interface Settings {
   timezone: string;
   flagDistanceKm: number;
 }
@@ -173,42 +176,51 @@ function getConfig(): Promise<Config> {
 }
 
 async function loadConfig(): Promise<Config> {
-  const [secrets, settings] = await Promise.all([
-    supabase
-      .from("app_secrets")
-      .select("key, value")
-      .in("key", ["telegram_bot_token", "telegram_webhook_secret"]),
-    supabase.from("settings").select("key, value").in("key", [
-      "timezone",
-      "flag_distance_km",
-    ]),
-  ]);
-
+  const secrets = await supabase
+    .from("app_secrets")
+    .select("key, value")
+    .in("key", ["telegram_bot_token", "telegram_webhook_secret"]);
   if (secrets.error) throw secrets.error;
-  if (settings.error) throw settings.error;
 
   const secretMap = new Map<string, string>(
     (secrets.data ?? []).map((r) => [r.key as string, r.value as string]),
   );
-  const settingMap = new Map<string, unknown>(
-    (settings.data ?? []).map((r) => [r.key as string, r.value]),
-  );
-
   const botToken = secretMap.get("telegram_bot_token");
   const webhookSecret = secretMap.get("telegram_webhook_secret");
   if (!botToken || !webhookSecret) {
     throw new Error("app_secrets is missing telegram_bot_token / telegram_webhook_secret");
   }
+  return { botToken, webhookSecret };
+}
 
-  const tz = settingMap.get("timezone");
-  const km = settingMap.get("flag_distance_km");
+// Settings are admin-tunable, so a warm isolate must pick changes up: 60s TTL.
+const SETTINGS_TTL_MS = 60_000;
+let settingsCache: { value: Settings; at: number } | null = null;
 
-  return {
-    botToken,
-    webhookSecret,
+async function getSettings(): Promise<Settings> {
+  if (settingsCache && Date.now() - settingsCache.at < SETTINGS_TTL_MS) {
+    return settingsCache.value;
+  }
+  const res = await supabase.from("settings").select("key, value").in("key", [
+    "timezone",
+    "flag_distance_km",
+  ]);
+  if (res.error) {
+    // fall back to the stale value rather than failing the update
+    if (settingsCache) return settingsCache.value;
+    throw res.error;
+  }
+  const map = new Map<string, unknown>(
+    (res.data ?? []).map((r) => [r.key as string, r.value]),
+  );
+  const tz = map.get("timezone");
+  const km = map.get("flag_distance_km");
+  const value: Settings = {
     timezone: typeof tz === "string" && tz ? tz : "Asia/Singapore",
     flagDistanceKm: typeof km === "number" && km > 0 ? km : 10,
   };
+  settingsCache = { value, at: Date.now() };
+  return value;
 }
 
 // ---------------------------------------------------------------- telegram
@@ -263,7 +275,7 @@ const REMOVE_KEYBOARD = { remove_keyboard: true };
 // ---------------------------------------------------------------- time helpers
 
 async function tz(): Promise<string> {
-  return (await getConfig()).timezone;
+  return (await getSettings()).timezone;
 }
 
 async function fmtTime(when: Date | string): Promise<string> {
@@ -317,21 +329,32 @@ function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number)
 
 // ---------------------------------------------------------------- session
 
+/** A non-idle state left alone this long is stale — revert to idle, keep the sticky project. */
+const SESSION_STALE_MS = 30 * 60_000;
+
 async function getSession(chatId: number): Promise<Session> {
   const { data, error } = await supabase
     .from("chat_sessions")
-    .select("chat_id, worker_id, state, draft")
+    .select("chat_id, worker_id, state, draft, updated_at")
     .eq("chat_id", chatId)
     .maybeSingle();
 
   if (error) throw error;
   if (!data) return { chat_id: chatId, worker_id: null, state: "idle", draft: {} };
 
+  let state = (data.state ?? "idle") as SessionState;
+  let draft = (data.draft ?? {}) as Draft;
+  const age = Date.now() - new Date(data.updated_at).getTime();
+  if (state !== "idle" && age > SESSION_STALE_MS) {
+    state = "idle";
+    draft = resetDraft(draft);
+  }
+
   return {
     chat_id: chatId,
     worker_id: data.worker_id ?? null,
-    state: (data.state ?? "idle") as SessionState,
-    draft: (data.draft ?? {}) as Draft,
+    state,
+    draft,
   };
 }
 
@@ -415,12 +438,14 @@ async function listProjects(workerId: number): Promise<Project[]> {
 }
 
 async function openAttendance(workerId: number): Promise<Attendance | null> {
+  // "open" = not checked out and not administratively closed by the no_checkout
+  // sweep — review flags (far_apart etc.) never hide a live shift from the bot.
   const { data, error } = await supabase
     .from("attendance")
-    .select("id, worker_id, project_id, check_in_at, in_lat, in_lng")
+    .select("id, worker_id, project_id, check_in_at, in_lat, in_lng, flags")
     .eq("worker_id", workerId)
     .is("check_out_at", null)
-    .eq("review_status", "none")
+    .not("flags", "cs", "{no_checkout}")
     .maybeSingle();
   if (error) throw error;
   return (data as Attendance) ?? null;
@@ -498,14 +523,8 @@ Deno.serve(async (req) => {
     console.error("update handling failed", err);
     // secret header already validated above — safe to echo diagnostics to the tester
     if (req.headers.get("x-debug") === "1") {
-      const e = err as { message?: string; stack?: string; code?: string; details?: string };
-      return jsonResponse({
-        ok: false,
-        error: String(e?.message ?? err),
-        code: e?.code ?? null,
-        details: e?.details ?? null,
-        stack: String(e?.stack ?? "").slice(0, 600),
-      });
+      const e = err as { message?: string; code?: string };
+      return jsonResponse({ ok: false, error: String(e?.message ?? err), code: e?.code ?? null });
     }
   }
 
@@ -530,6 +549,9 @@ function handleUpdate(update: TgUpdate): Promise<void> {
 async function handleMessage(message: TgMessage): Promise<void> {
   const from = message.from;
   if (!from || !message.chat?.id) return;
+  // Private chats only: in a group, sessions (keyed by chat) and identities
+  // (keyed by sender) would cross-attribute reports and check-ins.
+  if (message.chat.type && message.chat.type !== "private") return;
 
   const chatId = message.chat.id;
   const session = await getSession(chatId);
@@ -569,9 +591,9 @@ async function handleMessage(message: TgMessage): Promise<void> {
       });
       return;
     case "adding_note":
-      return saveNoteFromText(chatId, session, text);
+      return saveNoteFromText(chatId, worker, session, text);
     case "typing_date":
-      return saveDateFromText(chatId, session, text);
+      return saveDateFromText(chatId, worker, session, text);
     case "choosing_project_for_media":
       await send(chatId, "Pick a project from the buttons above first.");
       return;
@@ -627,10 +649,24 @@ async function handleCommand(
     case "help":
       await send(chatId, HELP_TEXT, { reply_markup: REMOVE_KEYBOARD });
       return;
-    case "cancel":
+    case "cancel": {
+      const { data: pend } = await supabase
+        .from("pending_media")
+        .select("id")
+        .eq("chat_id", chatId);
+      if (pend?.length) {
+        await supabase.from("pending_media").delete().eq("chat_id", chatId);
+      }
       await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
-      await send(chatId, "Cancelled.", { reply_markup: REMOVE_KEYBOARD });
+      await send(
+        chatId,
+        pend?.length
+          ? `Cancelled — discarded ${pend.length} unsaved file(s).`
+          : "Cancelled.",
+        { reply_markup: REMOVE_KEYBOARD },
+      );
       return;
+    }
     case "project":
       return cmdProject(chatId, worker);
     case "status":
@@ -760,7 +796,7 @@ async function doCheckout(
     return;
   }
 
-  const { flagDistanceKm } = await getConfig();
+  const { flagDistanceKm } = await getSettings();
   const distance = haversineMeters(open.in_lat, open.in_lng, location.latitude, location.longitude);
   const farApart = distance >= flagDistanceKm * 1000;
   const checkOutAt = new Date();
@@ -772,7 +808,12 @@ async function doCheckout(
       out_lat: location.latitude,
       out_lng: location.longitude,
       distance_m: distance,
-      ...(farApart ? { flags: ["far_apart"], review_status: "pending" } : {}),
+      ...(farApart
+        ? {
+          flags: Array.from(new Set([...(open.flags ?? []), "far_apart"])),
+          review_status: "pending",
+        }
+        : {}),
     })
     .eq("id", open.id);
   if (error) throw error;
@@ -836,6 +877,7 @@ function extractMedia(message: TgMessage): MediaDescriptor | null {
       width: largest.width ?? null,
       height: largest.height ?? null,
       media_group_id: group,
+      file_name: null,
       ext: "jpg",
     };
   }
@@ -850,6 +892,7 @@ function extractMedia(message: TgMessage): MediaDescriptor | null {
       width: v.width ?? null,
       height: v.height ?? null,
       media_group_id: group,
+      file_name: v.file_name ?? null,
       ext: extFromMime(v.mime_type) ?? extFromFilename(v.file_name) ?? "mp4",
     };
   }
@@ -864,12 +907,31 @@ function extractMedia(message: TgMessage): MediaDescriptor | null {
       width: null,
       height: null,
       media_group_id: group,
+      file_name: d.file_name ?? null,
       ext: extFromFilename(d.file_name) ?? extFromMime(d.mime_type) ?? "bin",
     };
   }
 
   return null;
 }
+
+/**
+ * Fetch a report only if it belongs to the given worker. The webhook writes as
+ * service role, so this ownership check is the authorization layer for every
+ * report-mutating callback — callback data is attacker-controllable.
+ */
+async function ownedReport(reportId: number, workerId: number): Promise<Report | null> {
+  const { data, error } = await supabase
+    .from("reports")
+    .select("id, project_id, worker_id, report_date, note")
+    .eq("id", reportId)
+    .eq("worker_id", workerId)
+    .maybeSingle();
+  if (error) throw error;
+  return (data as Report) ?? null;
+}
+
+const NOT_YOURS = "That report was filed by someone else — only they can edit it.";
 
 /** Report that already owns this album. */
 async function findAlbumReport(groupId: string): Promise<Report | null> {
@@ -882,6 +944,8 @@ async function findAlbumReport(groupId: string): Promise<Report | null> {
   return (data as Report) ?? null;
 }
 
+const RESEND_WARNING = "⚠️ That file couldn't be saved — please resend it.";
+
 async function handleIncomingMedia(
   chatId: number,
   worker: Worker,
@@ -893,7 +957,8 @@ async function handleIncomingMedia(
   if (media.media_group_id) {
     const report = await findAlbumReport(media.media_group_id);
     if (report) {
-      await storeMedia(report, media);
+      const ok = await storeMedia(report, media);
+      if (!ok) await send(chatId, RESEND_WARNING);
       if (caption && report.note === null) {
         await supabase.from("reports").update({ note: caption }).eq("id", report.id);
       }
@@ -901,34 +966,29 @@ async function handleIncomingMedia(
     }
   }
 
-  // More media (album parts or extra singles) while the project picker is open
-  // → queue behind the pending batch instead of overwriting it.
-  if (session.state === "choosing_project_for_media" && session.draft.pending_media?.length) {
-    const draft: Draft = {
-      ...session.draft,
-      pending_media: [...session.draft.pending_media, media],
-      pending_caption: session.draft.pending_caption ?? caption,
-    };
-    await saveSession(session, { draft });
-    return;
-  }
-
   const projectId = session.draft.project_id ?? worker.default_project_id ?? null;
 
   if (projectId === null) {
-    const rows = await projectKeyboard(worker.id, "pjm");
-    if (!rows) {
-      await send(chatId, "No active projects yet. Ask your admin to set one up.");
-      return;
+    // Persist pending media as table rows — concurrent album parts INSERT
+    // instead of racing over one session-draft blob.
+    const { error } = await supabase
+      .from("pending_media")
+      .insert({ chat_id: chatId, media, caption });
+    if (error) throw error;
+
+    if (session.state !== "choosing_project_for_media") {
+      const rows = await projectKeyboard(worker.id, "pjm");
+      if (!rows) {
+        await supabase.from("pending_media").delete().eq("chat_id", chatId);
+        await send(chatId, "No active projects yet. Ask your admin to set one up.");
+        return;
+      }
+      await saveSession(session, {
+        state: "choosing_project_for_media",
+        draft: { ...session.draft, pending_group: media.media_group_id },
+      });
+      await send(chatId, "Which site is this for?", { reply_markup: { inline_keyboard: rows } });
     }
-    const draft: Draft = {
-      ...session.draft,
-      pending_media: [media],
-      pending_group: media.media_group_id,
-      pending_caption: caption,
-    };
-    await saveSession(session, { state: "choosing_project_for_media", draft });
-    await send(chatId, "Which site is this for?", { reply_markup: { inline_keyboard: rows } });
     return;
   }
 
@@ -938,7 +998,15 @@ async function handleIncomingMedia(
     caption,
     media.media_group_id,
   );
-  await storeMedia(report, media);
+  const ok = await storeMedia(report, media);
+  if (!ok) {
+    if (created && !media.media_group_id) {
+      // solo report with zero stored files is noise — remove it
+      await supabase.from("reports").delete().eq("id", report.id);
+    }
+    await send(chatId, RESEND_WARNING);
+    return;
+  }
   if (created) {
     const project = await getProject(projectId);
     await sendReportConfirmation(chatId, report, project?.code ?? "site");
@@ -977,49 +1045,71 @@ async function createReport(
   throw error;
 }
 
-/** Download from Telegram, upload to storage, record the row. */
-async function storeMedia(report: Report, media: MediaDescriptor): Promise<void> {
-  const { botToken } = await getConfig();
+/**
+ * Download from Telegram, upload to storage, record the row.
+ * Returns false on any failure so callers can tell the worker instead of
+ * silently confirming a report whose file was never archived.
+ */
+async function storeMedia(report: Report, media: MediaDescriptor): Promise<boolean> {
+  try {
+    const { botToken } = await getConfig();
 
-  const file = await tg("getFile", { file_id: media.telegram_file_id });
-  if (!file?.file_path) {
-    console.error("getFile returned no file_path", media.telegram_file_id);
-    return;
+    const file = await tg("getFile", { file_id: media.telegram_file_id });
+    if (!file?.file_path) {
+      console.error("getFile returned no file_path", media.telegram_file_id);
+      return false;
+    }
+
+    const res = await fetch(`https://api.telegram.org/file/bot${botToken}/${file.file_path}`);
+    if (!res.ok) {
+      console.error("telegram file download failed", res.status, media.telegram_file_id);
+      return false;
+    }
+    const bytes = new Uint8Array(await res.arrayBuffer());
+
+    const contentType = media.mime_type ?? extToMime(media.ext);
+    const storagePath =
+      `project_${report.project_id}/${report.report_date}/${report.id}/${crypto.randomUUID()}.${media.ext}`;
+
+    const upload = await supabase.storage
+      .from("site-media")
+      .upload(storagePath, bytes, { contentType, upsert: false });
+    if (upload.error) {
+      console.error("storage upload failed", upload.error);
+      return false;
+    }
+
+    const { error } = await supabase.from("report_media").insert({
+      report_id: report.id,
+      storage_path: storagePath,
+      media_type: media.media_type,
+      telegram_file_id: media.telegram_file_id,
+      mime_type: contentType,
+      file_size: media.file_size ?? bytes.byteLength,
+      width: media.width,
+      height: media.height,
+      media_group_id: media.media_group_id,
+      file_name: media.file_name,
+    });
+    if (error) {
+      console.error("report_media insert failed", error);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error("storeMedia threw", err);
+    return false;
   }
-
-  const res = await fetch(`https://api.telegram.org/file/bot${botToken}/${file.file_path}`);
-  if (!res.ok) {
-    console.error("telegram file download failed", res.status, media.telegram_file_id);
-    return;
-  }
-  const bytes = new Uint8Array(await res.arrayBuffer());
-
-  const contentType = media.mime_type ?? extToMime(media.ext);
-  const storagePath =
-    `project_${report.project_id}/${report.report_date}/${report.id}/${crypto.randomUUID()}.${media.ext}`;
-
-  const upload = await supabase.storage
-    .from("site-media")
-    .upload(storagePath, bytes, { contentType, upsert: false });
-  if (upload.error) throw upload.error;
-
-  const { error } = await supabase.from("report_media").insert({
-    report_id: report.id,
-    storage_path: storagePath,
-    media_type: media.media_type,
-    telegram_file_id: media.telegram_file_id,
-    mime_type: contentType,
-    file_size: media.file_size ?? bytes.byteLength,
-    width: media.width,
-    height: media.height,
-    media_group_id: media.media_group_id,
-  });
-  if (error) throw error;
 }
 
 // ---------------------------------------------------------------- text states
 
-async function saveNoteFromText(chatId: number, session: Session, text: string): Promise<void> {
+async function saveNoteFromText(
+  chatId: number,
+  worker: Worker,
+  session: Session,
+  text: string,
+): Promise<void> {
   const reportId = session.draft.report_id;
   if (!reportId) {
     await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
@@ -1027,7 +1117,11 @@ async function saveNoteFromText(chatId: number, session: Session, text: string):
     return;
   }
 
-  const { error } = await supabase.from("reports").update({ note: text }).eq("id", reportId);
+  const { error } = await supabase
+    .from("reports")
+    .update({ note: text })
+    .eq("id", reportId)
+    .eq("worker_id", worker.id);
   if (error) throw error;
 
   await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
@@ -1066,7 +1160,12 @@ function parseDate(input: string): string | null {
   return `${y}-${pad(m)}-${pad(d)}`;
 }
 
-async function saveDateFromText(chatId: number, session: Session, text: string): Promise<void> {
+async function saveDateFromText(
+  chatId: number,
+  worker: Worker,
+  session: Session,
+  text: string,
+): Promise<void> {
   const reportId = session.draft.report_id;
   if (!reportId) {
     await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
@@ -1080,7 +1179,11 @@ async function saveDateFromText(chatId: number, session: Session, text: string):
     return;
   }
 
-  const { error } = await supabase.from("reports").update({ report_date: parsed }).eq("id", reportId);
+  const { error } = await supabase
+    .from("reports")
+    .update({ report_date: parsed })
+    .eq("id", reportId)
+    .eq("worker_id", worker.id);
   if (error) throw error;
 
   await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
@@ -1092,7 +1195,8 @@ async function saveDateFromText(chatId: number, session: Session, text: string):
 async function handleCallbackQuery(query: TgCallbackQuery): Promise<void> {
   const chatId = query.message?.chat?.id;
   const messageId = query.message?.message_id;
-  if (!chatId || !query.data) {
+  const chatType = query.message?.chat?.type;
+  if (!chatId || !query.data || (chatType && chatType !== "private")) {
     await answerCallback(query.id);
     return;
   }
@@ -1108,6 +1212,16 @@ async function handleCallbackQuery(query: TgCallbackQuery): Promise<void> {
 
   const parts = query.data.split(":");
   const action = parts[0];
+
+  // every r* action edits a report → ownership is checked before dispatch
+  const reportActions = ["rn", "rd", "rdd", "rdt", "rp", "rpp"];
+  if (reportActions.includes(action)) {
+    const report = await ownedReport(Number(parts[1]), worker.id);
+    if (!report) {
+      await send(chatId, NOT_YOURS);
+      return;
+    }
+  }
 
   switch (action) {
     case "pj":
@@ -1160,7 +1274,14 @@ async function cbPickProjectForMedia(
     return;
   }
 
-  const pending = session.draft.pending_media ?? [];
+  const { data: pendRows, error: pendErr } = await supabase
+    .from("pending_media")
+    .select("id, media, caption")
+    .eq("chat_id", chatId)
+    .order("id");
+  if (pendErr) throw pendErr;
+  const pending = (pendRows ?? []) as { id: number; media: MediaDescriptor; caption: string | null }[];
+
   if (messageId) await editKeyboard(chatId, messageId, []);
 
   if (pending.length === 0) {
@@ -1172,21 +1293,39 @@ async function cbPickProjectForMedia(
     return;
   }
 
-  const { report, created } = await createReport(
-    worker.id,
-    projectId,
-    session.draft.pending_caption ?? null,
-    session.draft.pending_group ?? null,
-  );
-  for (const media of pending) {
-    await storeMedia(report, media);
+  const caption = pending.find((p) => p.caption)?.caption ?? null;
+  const group = session.draft.pending_group ??
+    pending.find((p) => p.media.media_group_id)?.media.media_group_id ?? null;
+
+  const { report, created } = await createReport(worker.id, projectId, caption, group);
+
+  // bounded parallelism: 3 at a time keeps a big album inside the wall clock
+  let stored = 0;
+  for (let i = 0; i < pending.length; i += 3) {
+    const results = await Promise.all(
+      pending.slice(i, i + 3).map((p) => storeMedia(report, p.media)),
+    );
+    stored += results.filter(Boolean).length;
   }
+  await supabase.from("pending_media").delete().eq("chat_id", chatId);
 
   await saveSession(session, {
     state: "idle",
     draft: { project_id: projectId, report_id: report.id },
   });
+
+  if (stored === 0) {
+    if (created) await supabase.from("reports").delete().eq("id", report.id);
+    await send(chatId, "⚠️ None of the files could be saved — please resend them.");
+    return;
+  }
   if (created) await sendReportConfirmation(chatId, report, project.code);
+  if (stored < pending.length) {
+    await send(
+      chatId,
+      `⚠️ ${pending.length - stored} of ${pending.length} files couldn't be saved — please resend them.`,
+    );
+  }
 }
 
 async function cbAskNote(chatId: number, session: Session, reportId: number): Promise<void> {

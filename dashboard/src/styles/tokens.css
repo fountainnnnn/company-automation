@@ -3,7 +3,8 @@
   --surface: #f7f6f3;
   --card: #ffffff;
   --ink: #1c1917;
-  --ink-2: #78716c;
+  /* 4.6:1 on --surface and on the light chip tints. */
+  --ink-2: #67615c;
   --hairline: rgba(28, 25, 23, 0.08);
   --hairline-strong: rgba(28, 25, 23, 0.14);
 

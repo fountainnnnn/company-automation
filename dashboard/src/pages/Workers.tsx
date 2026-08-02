@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
 import { supabase } from "../lib/supabase";
-import { formatDay } from "../lib/format";
+import { formatDay, toSgtDay } from "../lib/format";
 import type { Project, ProjectWorker, Worker } from "../lib/types";
 import { SectionHeader } from "../components/SectionHeader";
 import { Button } from "../components/Button";
-import { Modal } from "../components/Modal";
+import { ConfirmDialog, Modal } from "../components/Modal";
 import { EmptyState } from "../components/EmptyState";
 import { SkeletonList } from "../components/Skeleton";
 import { useToast } from "../components/Toast";
@@ -21,6 +21,7 @@ export function WorkersPage() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [links, setLinks] = useState<ProjectWorker[]>([]);
   const [assign, setAssign] = useState<AssignState | null>(null);
+  const [disabling, setDisabling] = useState<{ worker: Worker; reject: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
@@ -59,10 +60,16 @@ export function WorkersPage() {
     setBusy(true);
     const { worker, projectIds, defaultId } = assign;
 
-    const { error: delErr } = await supabase
-      .from("project_workers")
-      .delete()
-      .eq("worker_id", worker.id);
+    // Only the projects this dialog can actually show are ours to rewrite —
+    // an unscoped delete would silently drop links to archived projects.
+    const activeProjectIds = projects.map((p) => p.id);
+    const { error: delErr } = activeProjectIds.length
+      ? await supabase
+          .from("project_workers")
+          .delete()
+          .eq("worker_id", worker.id)
+          .in("project_id", activeProjectIds)
+      : { error: null };
     if (delErr) {
       setBusy(false);
       toast.error(delErr.message);
@@ -95,7 +102,9 @@ export function WorkersPage() {
     }
 
     setLinks((prev) => [
-      ...prev.filter((l) => l.worker_id !== worker.id),
+      ...prev.filter(
+        (l) => l.worker_id !== worker.id || !activeProjectIds.includes(l.project_id),
+      ),
       ...projectIds.map((project_id) => ({ project_id, worker_id: worker.id })),
     ]);
     setWorkers((prev) => (prev ?? []).map((w) => (w.id === worker.id ? { ...w, ...patch } : w)));
@@ -136,7 +145,7 @@ export function WorkersPage() {
                 </p>
                 <p className="muted" style={{ fontSize: "0.85rem" }}>
                   {w.telegram_username ? `@${w.telegram_username}` : "no username"} · registered{" "}
-                  {formatDay(w.created_at.slice(0, 10))}
+                  {formatDay(toSgtDay(w.created_at))}
                 </p>
               </div>
               <div className="row row-end">
@@ -154,9 +163,7 @@ export function WorkersPage() {
                 </Button>
                 <Button
                   variant="danger"
-                  onClick={() =>
-                    void patchWorker(w.id, { status: "disabled" }, `${w.full_name} rejected.`)
-                  }
+                  onClick={() => setDisabling({ worker: w, reject: true })}
                 >
                   Reject
                 </Button>
@@ -248,9 +255,7 @@ export function WorkersPage() {
                         {w.status === "active" ? (
                           <Button
                             variant="danger"
-                            onClick={() =>
-                              void patchWorker(w.id, { status: "disabled" }, "Worker disabled.")
-                            }
+                            onClick={() => setDisabling({ worker: w, reject: false })}
                           >
                             Disable
                           </Button>
@@ -272,6 +277,32 @@ export function WorkersPage() {
             </tbody>
           </table>
         </div>
+      )}
+
+      {disabling && (
+        <ConfirmDialog
+          title={disabling.reject ? "Reject this registration?" : "Disable this worker?"}
+          message={
+            disabling.reject
+              ? `${disabling.worker.full_name} will not be able to send from Telegram. You can enable them later from the workers table.`
+              : `${disabling.worker.full_name} will stop being able to send reports or check in. Their past records stay intact.`
+          }
+          confirmLabel={disabling.reject ? "Reject" : "Disable worker"}
+          busy={busy}
+          onConfirm={() => {
+            const { worker, reject } = disabling;
+            setBusy(true);
+            void patchWorker(
+              worker.id,
+              { status: "disabled" },
+              reject ? `${worker.full_name} rejected.` : "Worker disabled.",
+            ).finally(() => {
+              setBusy(false);
+              setDisabling(null);
+            });
+          }}
+          onClose={() => setDisabling(null)}
+        />
       )}
 
       {assign && (

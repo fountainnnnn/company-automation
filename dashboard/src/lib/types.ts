@@ -40,6 +40,8 @@ export interface ReportMedia {
   id: string;
   report_id: string;
   storage_path: string;
+  /** Original filename as it arrived from Telegram, when the sender gave one. */
+  file_name: string | null;
   media_type: MediaType;
   mime_type: string | null;
   file_size: number | null;
@@ -79,6 +81,15 @@ export interface Attendance {
   admin_note: string | null;
   workers: { full_name: string } | null;
   projects: { code: string; name: string } | null;
+}
+
+/** One row of the `project_stats()` RPC. */
+export interface ProjectStatsRow {
+  project_id: string | number;
+  report_count: number;
+  media_count: number;
+  last_activity: string | null;
+  cover_path: string | null;
 }
 
 export interface ProjectStats {

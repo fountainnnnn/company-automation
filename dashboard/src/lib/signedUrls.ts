@@ -55,8 +55,3 @@ export async function getSignedUrls(paths: string[]): Promise<Record<string, str
   }
   return out;
 }
-
-export async function getSignedUrl(path: string): Promise<string | null> {
-  const map = await getSignedUrls([path]);
-  return map[path] ?? null;
-}

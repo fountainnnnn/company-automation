@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useFocusTrap } from "../lib/useFocusTrap";
-import { fileNameOf } from "../lib/format";
+import { mediaLabel } from "../lib/reports";
 import type { ReportMedia } from "../lib/types";
 
 export interface LightboxItem {
@@ -23,6 +23,10 @@ function downloadHref(url: string): string {
 export function Lightbox({ items, index, onIndex, onClose }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const touchX = useRef<number | null>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
+  const prevRef = useRef<HTMLButtonElement>(null);
+  const nextRef = useRef<HTMLButtonElement>(null);
+  const lastArrow = useRef<"prev" | "next" | null>(null);
   useFocusTrap(ref, true);
 
   const current = items[index];
@@ -39,9 +43,21 @@ export function Lightbox({ items, index, onIndex, onClose }: Props) {
     return () => document.removeEventListener("keydown", onKey);
   }, [index, items.length, onIndex, onClose]);
 
+  // Reaching either end of the list disables the arrow you just pressed, and
+  // the browser drops focus to <body> — outside the trap. Hand it to Close.
+  useEffect(() => {
+    const held = lastArrow.current;
+    if (!held) return;
+    if (held === "prev" ? hasPrev : hasNext) return;
+    const active = document.activeElement;
+    if (active && active !== document.body && active !== ref.current) return;
+    lastArrow.current = null;
+    closeRef.current?.focus();
+  }, [hasPrev, hasNext]);
+
   if (!current) return null;
 
-  const name = fileNameOf(current.media.storage_path);
+  const name = mediaLabel(current.media);
 
   return (
     <div
@@ -82,7 +98,7 @@ export function Lightbox({ items, index, onIndex, onClose }: Props) {
             Download
           </a>
         )}
-        <button className="btn btn-on-dark" onClick={onClose}>
+        <button className="btn btn-on-dark" ref={closeRef} onClick={onClose}>
           Close
         </button>
       </div>
@@ -90,6 +106,10 @@ export function Lightbox({ items, index, onIndex, onClose }: Props) {
       <div className="lightbox-stage">
         <button
           className="nav-arrow"
+          ref={prevRef}
+          onFocus={() => {
+            lastArrow.current = "prev";
+          }}
           onClick={() => onIndex(index - 1)}
           disabled={!hasPrev}
           aria-label="Previous media"
@@ -118,6 +138,10 @@ export function Lightbox({ items, index, onIndex, onClose }: Props) {
 
         <button
           className="nav-arrow"
+          ref={nextRef}
+          onFocus={() => {
+            lastArrow.current = "next";
+          }}
           onClick={() => onIndex(index + 1)}
           disabled={!hasNext}
           aria-label="Next media"

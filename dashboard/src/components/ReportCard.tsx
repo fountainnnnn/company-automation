@@ -4,8 +4,9 @@ import { ConfirmDialog, Modal } from "./Modal";
 import { Lightbox } from "./Lightbox";
 import type { LightboxItem } from "./Lightbox";
 import { useToast } from "./Toast";
-import { supabase } from "../lib/supabase";
-import { fileNameOf, formatFileSize, formatTime } from "../lib/format";
+import { MEDIA_BUCKET, supabase } from "../lib/supabase";
+import { mediaLabel, REPORT_SELECT } from "../lib/reports";
+import { formatFileSize, formatTime } from "../lib/format";
 import type { Report, ReportMedia } from "../lib/types";
 
 interface Props {
@@ -37,6 +38,14 @@ export function ReportCard({
   const [note, setNote] = useState(report.note ?? "");
   const [date, setDate] = useState(report.report_date);
 
+  // Seed the form from the report as it stands right now, so an edit never
+  // starts from values a realtime update or a cancelled edit left behind.
+  function openEditor() {
+    setNote(report.note ?? "");
+    setDate(report.report_date);
+    setEditing(true);
+  }
+
   const alt = report.note?.trim() || "site photo";
   const items: LightboxItem[] = media.map((m) => ({
     media: m,
@@ -50,7 +59,7 @@ export function ReportCard({
       .from("reports")
       .update({ note: note.trim() || null, report_date: date })
       .eq("id", report.id)
-      .select("*,workers(full_name),projects(code,name),report_media(*)")
+      .select(REPORT_SELECT)
       .single();
     setBusy(false);
     if (error || !data) {
@@ -64,13 +73,27 @@ export function ReportCard({
 
   async function remove() {
     setBusy(true);
+
+    // Drop the files first: the row is the only pointer to them, so once it is
+    // gone the objects are unreachable.
+    const paths = (report.report_media ?? []).map((m) => m.storage_path);
+    let orphaned = false;
+    if (paths.length > 0) {
+      const { error: storageErr } = await supabase.storage.from(MEDIA_BUCKET).remove(paths);
+      orphaned = Boolean(storageErr);
+    }
+
     const { error } = await supabase.from("reports").delete().eq("id", report.id);
     setBusy(false);
     if (error) {
       toast.error(error.message);
       return;
     }
-    toast.success("Report deleted.");
+    if (orphaned) {
+      toast.error("Report deleted, but its files may still be in storage.");
+    } else {
+      toast.success("Report deleted.");
+    }
     setConfirming(false);
     onDeleted(report.id);
   }
@@ -91,7 +114,7 @@ export function ReportCard({
         <span className="spacer" />
         {admin && (
           <>
-            <Button variant="ghost" onClick={() => setEditing(true)}>
+            <Button variant="ghost" onClick={openEditor}>
               Edit
             </Button>
             <Button variant="danger" onClick={() => setConfirming(true)}>
@@ -107,7 +130,7 @@ export function ReportCard({
         <div className="thumbs">
           {media.map((m, i) => {
             const url = urls[m.storage_path];
-            const name = fileNameOf(m.storage_path);
+            const name = mediaLabel(m);
             return (
               <button
                 key={m.id}

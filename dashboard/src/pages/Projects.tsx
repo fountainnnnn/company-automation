@@ -11,18 +11,7 @@ import { EmptyState } from "../components/EmptyState";
 import { Button } from "../components/Button";
 import { useToast } from "../components/Toast";
 import { ProjectCreateModal } from "../components/ProjectCreateModal";
-import type { Project, ProjectStats } from "../lib/types";
-
-interface ReportStatRow {
-  project_id: string;
-  created_at: string;
-  report_media: { count: number }[];
-}
-
-interface CoverRow {
-  storage_path: string;
-  reports: { project_id: string } | null;
-}
+import type { Project, ProjectStats, ProjectStatsRow } from "../lib/types";
 
 export function ProjectsPage() {
   const { isAdmin } = useAuth();
@@ -55,60 +44,35 @@ export function ProjectsPage() {
     void load();
   }, [load]);
 
-  // Counts + last activity: one grouped query, aggregated client-side (no N+1).
+  // Counts, last activity and cover in one server-side pass — no unbounded
+  // scan of reports or report_media from the browser.
   useEffect(() => {
     let active = true;
     void (async () => {
-      const { data } = await supabase
-        .from("reports")
-        .select("project_id,created_at,report_media(count)");
+      const { data } = await supabase.rpc("project_stats");
       if (!active || !data) return;
-      const rows = data as unknown as ReportStatRow[];
-      const next: Record<string, ProjectStats> = {};
-      for (const row of rows) {
-        const entry = next[row.project_id] ?? {
-          mediaCount: 0,
-          reportCount: 0,
-          lastActivity: null,
-        };
-        entry.reportCount += 1;
-        entry.mediaCount += row.report_media?.[0]?.count ?? 0;
-        if (!entry.lastActivity || row.created_at > entry.lastActivity) {
-          entry.lastActivity = row.created_at;
-        }
-        next[row.project_id] = entry;
-      }
-      setStats(next);
-    })();
-    return () => {
-      active = false;
-    };
-  }, []);
+      const rows = data as ProjectStatsRow[];
 
-  // Covers: newest photos across all projects in one query, first-per-project wins.
-  useEffect(() => {
-    let active = true;
-    void (async () => {
-      const { data } = await supabase
-        .from("report_media")
-        .select("storage_path,created_at,reports!inner(project_id)")
-        .eq("media_type", "photo")
-        .order("created_at", { ascending: false })
-        .limit(400);
-      if (!active || !data) return;
-      const rows = data as unknown as CoverRow[];
+      const nextStats: Record<string, ProjectStats> = {};
       const pick: Record<string, string> = {};
       for (const row of rows) {
-        const pid = row.reports?.project_id;
-        if (pid && !pick[pid]) pick[pid] = row.storage_path;
+        const pid = String(row.project_id);
+        nextStats[pid] = {
+          reportCount: row.report_count ?? 0,
+          mediaCount: row.media_count ?? 0,
+          lastActivity: row.last_activity,
+        };
+        if (row.cover_path) pick[pid] = row.cover_path;
       }
+      setStats(nextStats);
+
       const urls = await getSignedUrls(Object.values(pick));
       if (!active) return;
-      const next: Record<string, string> = {};
+      const nextCovers: Record<string, string> = {};
       for (const [pid, path] of Object.entries(pick)) {
-        if (urls[path]) next[pid] = urls[path];
+        if (urls[path]) nextCovers[pid] = urls[path];
       }
-      setCovers(next);
+      setCovers(nextCovers);
     })();
     return () => {
       active = false;
@@ -164,7 +128,9 @@ export function ProjectsPage() {
                     <span className="chip code">{p.code}</span>
                   </div>
                   <p className="card-meta tnum">
-                    {s ? `${s.mediaCount} media · ${s.reportCount} reports` : "No media yet"}
+                    {s
+                      ? `${s.mediaCount} ${s.mediaCount === 1 ? "media file" : "media"} · ${s.reportCount} ${s.reportCount === 1 ? "report" : "reports"}`
+                      : "No media yet"}
                   </p>
                   <p className="card-meta">
                     Last activity {formatRelative(s?.lastActivity ?? null)}

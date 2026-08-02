@@ -1,6 +1,16 @@
 import { supabase } from "./supabase";
 import { getSignedUrls } from "./signedUrls";
+import { fileNameOf } from "./format";
 import type { Filters, Report, ReportMedia } from "./types";
+
+/**
+ * What to call a file on screen. Documents and videos carry the name the
+ * sender gave them in Telegram; anything else falls back to storage.
+ */
+export function mediaLabel(m: ReportMedia): string {
+  if (m.media_type !== "photo" && m.file_name?.trim()) return m.file_name.trim();
+  return fileNameOf(m.storage_path);
+}
 
 export const PAGE_SIZE = 30;
 export const REPORT_SELECT = "*,workers(full_name),projects(code,name),report_media(*)";

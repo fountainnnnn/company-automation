@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Modal } from "./Modal";
 import { Button } from "./Button";
 import { supabase } from "../lib/supabase";
@@ -10,6 +10,8 @@ interface Props {
   onCreated: (project: Project) => void;
 }
 
+type FieldName = "code" | "name";
+
 export function ProjectCreateModal({ onClose, onCreated }: Props) {
   const toast = useToast();
   const [code, setCode] = useState("");
@@ -18,12 +20,22 @@ export function ProjectCreateModal({ onClose, onCreated }: Props) {
   const [lat, setLat] = useState("");
   const [lng, setLng] = useState("");
   const [busy, setBusy] = useState(false);
+  const [fieldErrors, setFieldErrors] = useState<Partial<Record<FieldName, string>>>({});
+  const [formError, setFormError] = useState<string | null>(null);
+  const codeRef = useRef<HTMLInputElement>(null);
+  const nameRef = useRef<HTMLInputElement>(null);
 
   async function submit() {
-    if (!code.trim() || !name.trim()) {
-      toast.error("Code and name are required.");
+    const errors: Partial<Record<FieldName, string>> = {};
+    if (!code.trim()) errors.code = "A code is required.";
+    if (!name.trim()) errors.name = "A name is required.";
+    setFieldErrors(errors);
+    setFormError(null);
+    if (errors.code || errors.name) {
+      (errors.code ? codeRef : nameRef).current?.focus();
       return;
     }
+
     setBusy(true);
     const { data, error } = await supabase
       .from("projects")
@@ -39,7 +51,14 @@ export function ProjectCreateModal({ onClose, onCreated }: Props) {
       .single();
     setBusy(false);
     if (error || !data) {
-      toast.error(error?.message ?? "Could not create the project.");
+      const message = error?.message ?? "Could not create the project.";
+      // A duplicate code is the one server error the user can fix in place.
+      if (error?.code === "23505") {
+        setFieldErrors({ code: "That code is already in use." });
+        codeRef.current?.focus();
+      } else {
+        setFormError(message);
+      }
       return;
     }
     toast.success(`Project ${data.code} created.`);
@@ -61,25 +80,47 @@ export function ProjectCreateModal({ onClose, onCreated }: Props) {
         </>
       }
     >
+      {formError && (
+        <p className="form-error" role="alert">
+          {formError}
+        </p>
+      )}
+
       <div className="field">
         <label htmlFor="np-code">Code</label>
         <input
           id="np-code"
+          ref={codeRef}
           className="input"
           value={code}
           placeholder="SB-01"
+          aria-invalid={fieldErrors.code ? true : undefined}
+          aria-describedby={fieldErrors.code ? "np-code-error" : undefined}
           onChange={(e) => setCode(e.target.value)}
         />
+        {fieldErrors.code && (
+          <p className="form-error" id="np-code-error" role="alert">
+            {fieldErrors.code}
+          </p>
+        )}
       </div>
       <div className="field">
         <label htmlFor="np-name">Name</label>
         <input
           id="np-name"
+          ref={nameRef}
           className="input"
           value={name}
           placeholder="Site B — Tower 1"
+          aria-invalid={fieldErrors.name ? true : undefined}
+          aria-describedby={fieldErrors.name ? "np-name-error" : undefined}
           onChange={(e) => setName(e.target.value)}
         />
+        {fieldErrors.name && (
+          <p className="form-error" id="np-name-error" role="alert">
+            {fieldErrors.name}
+          </p>
+        )}
       </div>
       <div className="field">
         <label htmlFor="np-addr">Site address</label>

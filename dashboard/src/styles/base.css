@@ -259,6 +259,14 @@ a {
 }
 
 /* ---------- buttons ---------- */
+/* No 300ms tap delay on anything interactive. */
+button,
+a,
+label,
+summary,
+[role="button"] {
+  touch-action: manipulation;
+}
 .btn {
   display: inline-flex;
   align-items: center;
@@ -488,7 +496,7 @@ textarea.input {
 .chip.warn {
   background: rgba(217, 119, 6, 0.12);
   border-color: rgba(217, 119, 6, 0.24);
-  color: #a16207;
+  color: #8a5306;
 }
 .chip.flag {
   background: var(--flag-tint);
@@ -1117,8 +1125,33 @@ table.data tbody tr:hover {
   }
 }
 
+/* ---------- touch targets ---------- */
+@media (pointer: coarse) {
+  .btn,
+  .btn-outline-ink {
+    height: auto;
+    min-height: 44px;
+    padding: 0 16px;
+  }
+  .nav a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+    padding: 0 14px;
+  }
+  .nav-arrow {
+    width: 44px;
+    height: 44px;
+    min-height: 44px;
+  }
+}
+
 /* ---------- responsive ---------- */
 @media (max-width: 720px) {
+  /* The topbar wraps to two rows here; sticky headers must clear all of it. */
+  :root {
+    --topbar-h-mobile: 112px;
+  }
   .topbar {
     flex-wrap: wrap;
     row-gap: var(--s-2);
@@ -1131,7 +1164,7 @@ table.data tbody tr:hover {
     max-width: 90px;
   }
   .date-head {
-    top: var(--s-3);
+    top: calc(var(--topbar-h-mobile) + var(--s-3));
   }
   .page {
     padding-top: var(--s-5);
