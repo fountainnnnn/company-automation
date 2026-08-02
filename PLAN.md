@@ -1,6 +1,10 @@
 # Site Reporting & Attendance Pipeline
 
 **Plan & Architecture · v2.0 · 2026-08-03**
+
+> **BUILD STATUS (2026-08-03): SHIPPED.** All phases built, reviewed (8-angle
+> code review, all confirmed findings fixed) and tested against the live
+> deployment. See [README.md](README.md) for operations and known limitations.
 *(v1 was drafted for a different company's water-utility workflow — superseded in full.)*
 
 Replaces per-project WhatsApp group chats — where one person manually saves images into date folders and anything he misses is lost — with: **Telegram bot** (workers send site photos + info, check in/out with GPS) → **Supabase** (Postgres + Storage, system of record) → **Web dashboard** (real-time feed, powerful filter/search, role-gated: admin vs staff).
