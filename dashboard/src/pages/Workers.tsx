@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { supabase } from "../lib/supabase";
 import { formatDay, toSgtDay } from "../lib/format";
-import type { Project, ProjectWorker, Worker } from "../lib/types";
+import type { Project, ProjectWorker, TimesheetRole, Worker } from "../lib/types";
 import { SectionHeader } from "../components/SectionHeader";
 import { Button } from "../components/Button";
 import { ConfirmDialog, Modal } from "../components/Modal";
@@ -9,6 +9,8 @@ import { EmptyState } from "../components/EmptyState";
 import { SkeletonList } from "../components/Skeleton";
 import { StatusChip } from "../components/StatusChip";
 import { useToast } from "../components/Toast";
+
+const WORKER_ROLES: TimesheetRole[] = ["worker", "driver", "welder", "supervisor"];
 
 interface AssignState {
   worker: Worker;
@@ -46,14 +48,22 @@ export function WorkersPage() {
     return projects.filter((p) => ids.has(p.id));
   }
 
-  async function patchWorker(id: string, patch: Partial<Worker>, message: string) {
+  async function patchWorker(
+    id: string,
+    patch: Partial<Worker>,
+    message: string,
+  ): Promise<boolean> {
     const { error } = await supabase.from("workers").update(patch).eq("id", id);
     if (error) {
-      toast.error(error.message);
-      return;
+      // A duplicate worker code is an everyday typo, not a database failure.
+      toast.error(
+        error.code === "23505" ? "That worker ID is already taken." : error.message,
+      );
+      return false;
     }
     setWorkers((prev) => (prev ?? []).map((w) => (w.id === id ? { ...w, ...patch } : w)));
     toast.success(message);
+    return true;
   }
 
   async function saveAssignment() {
@@ -123,9 +133,12 @@ export function WorkersPage() {
   return (
     <div className="reveal">
       <SectionHeader
-        eyebrow="Workers"
-        title="Who can send from the field."
-        subtitle="Approve Telegram registrations, assign sites, and disable people who leave."
+        title="Workers"
+        subtitle={
+          workers === null
+            ? undefined
+            : `${pending.length} pending · ${rest.length} approved`
+        }
       />
 
       <h2 className="sub-head">Pending registrations</h2>
@@ -188,6 +201,9 @@ export function WorkersPage() {
             <thead>
               <tr>
                 <th>Name</th>
+                <th>Worker ID</th>
+                <th>Role</th>
+                <th>Team</th>
                 <th>Telegram</th>
                 <th>Projects</th>
                 <th>Default</th>
@@ -207,12 +223,81 @@ export function WorkersPage() {
                       </label>
                       <input
                         id={`wn-${w.id}`}
-                        className="input"
+                        className="input input-sm"
                         defaultValue={w.full_name}
                         onBlur={(e) => {
                           const next = e.target.value.trim();
                           if (next && next !== w.full_name) {
                             void patchWorker(w.id, { full_name: next }, "Name updated.");
+                          }
+                        }}
+                      />
+                    </td>
+                    <td style={{ minWidth: 110 }}>
+                      <label className="sr-only" htmlFor={`wc-${w.id}`}>
+                        Worker ID for {w.full_name}
+                      </label>
+                      <input
+                        id={`wc-${w.id}`}
+                        className="input input-sm"
+                        defaultValue={w.worker_code ?? ""}
+                        placeholder="e.g. W103"
+                        onBlur={(e) => {
+                          const input = e.target;
+                          const next = input.value.trim().toUpperCase();
+                          if (next === (w.worker_code ?? "")) return;
+                          void patchWorker(
+                            w.id,
+                            { worker_code: next || null },
+                            // Setting the code links this worker's past roster entries.
+                            next ? `Worker ID set to ${next}.` : "Worker ID cleared.",
+                          ).then((ok) => {
+                            // A rejected code must not sit in the field looking saved.
+                            if (!ok) input.value = w.worker_code ?? "";
+                          });
+                        }}
+                      />
+                    </td>
+                    <td style={{ minWidth: 120 }}>
+                      <label className="sr-only" htmlFor={`wr-${w.id}`}>
+                        Role for {w.full_name}
+                      </label>
+                      <select
+                        id={`wr-${w.id}`}
+                        className="select select-sm"
+                        value={w.role}
+                        onChange={(e) =>
+                          void patchWorker(
+                            w.id,
+                            { role: e.target.value as Worker["role"] },
+                            "Role updated.",
+                          )
+                        }
+                      >
+                        {WORKER_ROLES.map((r) => (
+                          <option key={r} value={r}>
+                            {r.charAt(0).toUpperCase() + r.slice(1)}
+                          </option>
+                        ))}
+                      </select>
+                    </td>
+                    <td style={{ minWidth: 84 }}>
+                      <label className="sr-only" htmlFor={`wt-${w.id}`}>
+                        Team for {w.full_name}
+                      </label>
+                      <input
+                        id={`wt-${w.id}`}
+                        className="input input-sm"
+                        defaultValue={w.team_number ?? ""}
+                        placeholder="e.g. 1"
+                        onBlur={(e) => {
+                          const next = e.target.value.trim();
+                          if (next !== (w.team_number ?? "")) {
+                            void patchWorker(
+                              w.id,
+                              { team_number: next || null },
+                              next ? `Team set to ${next}.` : "Team cleared.",
+                            );
                           }
                         }}
                       />

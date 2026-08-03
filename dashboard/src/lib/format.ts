@@ -23,6 +23,12 @@ const dayFmt = new Intl.DateTimeFormat("en-GB", {
   year: "numeric",
 });
 
+const shortDayFmt = new Intl.DateTimeFormat("en-GB", {
+  timeZone: APP_TZ,
+  day: "numeric",
+  month: "short",
+});
+
 const weekdayFmt = new Intl.DateTimeFormat("en-GB", {
   timeZone: APP_TZ,
   weekday: "long",
@@ -57,6 +63,12 @@ const isoDayFmt = new Intl.DateTimeFormat("en-CA", {
 export function formatDay(dateOnly: string): string {
   const d = dayDate(dateOnly);
   return d ? dayFmt.format(d) : dateOnly;
+}
+
+/** "12 Mar" from a `date` column — chart axis labels, where space is tight. */
+export function formatDayShort(dateOnly: string): string {
+  const d = dayDate(dateOnly);
+  return d ? shortDayFmt.format(d) : dateOnly;
 }
 
 /** "Thursday" — used in date group headers alongside the full date. */

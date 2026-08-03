@@ -33,8 +33,14 @@ export function SettingsPage() {
 
   async function save() {
     const km = Number(value);
+    // An unbounded threshold silently disables flagging, so refuse the nonsense
+    // range rather than storing it.
     if (!Number.isFinite(km) || km <= 0) {
       toast.error("Enter a distance greater than zero.");
+      return;
+    }
+    if (km > 500) {
+      toast.error("That's larger than any realistic shift — use 500 km or less.");
       return;
     }
     setBusy(true);
@@ -51,11 +57,7 @@ export function SettingsPage() {
 
   return (
     <div className="reveal">
-      <SectionHeader
-        eyebrow="Settings"
-        title="One number that decides what gets flagged."
-        subtitle="Tune it to how far your crews legitimately travel during a shift."
-      />
+      <SectionHeader title="Settings" />
 
       <Card style={{ maxWidth: 520 }}>
         <div className="field">
@@ -68,6 +70,7 @@ export function SettingsPage() {
               className="input tnum"
               type="number"
               min={0.1}
+              max={500}
               step={0.1}
               value={value}
               onChange={(e) => setValue(e.target.value)}

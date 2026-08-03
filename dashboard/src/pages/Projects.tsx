@@ -4,7 +4,6 @@ import { supabase } from "../lib/supabase";
 import { getSignedUrls } from "../lib/signedUrls";
 import { useAuth } from "../lib/auth";
 import { formatRelative } from "../lib/format";
-import { glowVars } from "../components/Card";
 import { SectionHeader } from "../components/SectionHeader";
 import { SkeletonCards } from "../components/Skeleton";
 import { EmptyState } from "../components/EmptyState";
@@ -82,9 +81,14 @@ export function ProjectsPage() {
   return (
     <div className="reveal">
       <SectionHeader
-        eyebrow="Projects"
-        title={showArchived ? "Archived sites." : "Every site, at a glance."}
-        subtitle="Open a project to browse its photo record by date, worker or note."
+        title="Projects"
+        subtitle={
+          projects === null
+            ? undefined
+            : `${projects.length} ${showArchived ? "archived" : "active"} ${
+                projects.length === 1 ? "project" : "projects"
+              }`
+        }
         actions={
           isAdmin ? (
             <Button variant="secondary" onClick={() => setShowArchived((v) => !v)}>
@@ -103,21 +107,20 @@ export function ProjectsPage() {
         />
       ) : (
         <div className="grid-cards">
-          {projects.map((p, i) => {
+          {projects.map((p) => {
             const s = stats[p.id];
             const cover = covers[p.id];
             return (
               <button
                 key={p.id}
-                className="glow-card project-card"
-                style={glowVars(i)}
+                className="panel project-card"
                 onClick={() => navigate(`/projects/${p.id}`)}
               >
                 <div className="project-cover">
                   {cover ? (
                     <img src={cover} alt={`Latest site photo from ${p.name}`} loading="lazy" />
                   ) : (
-                    <div className="mesh" aria-hidden="true" />
+                    <div className="cover-blank" aria-hidden="true" />
                   )}
                 </div>
                 <div className="project-body">

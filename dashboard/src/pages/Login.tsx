@@ -32,10 +32,15 @@ export function LoginPage() {
     <>
       <div className="orb" aria-hidden="true" />
       <div className="login-wrap">
-        <div className="glow-card login-card reveal">
-          <p className="eyebrow">CL AUTOMATION</p>
-          <h1>Site records, found in seconds.</h1>
-          <p className="sub" style={{ marginTop: 12 }}>
+        <div className="login-card reveal">
+          <span className="brand">
+            <span className="side-mark" aria-hidden="true">
+              CL
+            </span>
+            CL Automation
+          </span>
+          <h1>Sign in</h1>
+          <p className="sub">
             Every site photo, note and check-in — filed by project, date and worker.
           </p>
 

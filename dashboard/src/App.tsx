@@ -7,11 +7,17 @@ import { Shell } from "./components/Shell";
 import { LoginPage } from "./pages/Login";
 
 // Route-level code splitting — admin views never ship to staff sessions.
+const OverviewPage = lazy(() =>
+  import("./pages/Overview").then((m) => ({ default: m.OverviewPage })),
+);
 const ProjectsPage = lazy(() =>
   import("./pages/Projects").then((m) => ({ default: m.ProjectsPage })),
 );
 const GalleryPage = lazy(() =>
   import("./pages/Gallery").then((m) => ({ default: m.GalleryPage })),
+);
+const TimesheetsPage = lazy(() =>
+  import("./pages/Timesheets").then((m) => ({ default: m.TimesheetsPage })),
 );
 const SearchPage = lazy(() => import("./pages/Search").then((m) => ({ default: m.SearchPage })));
 const AttendancePage = lazy(() =>
@@ -60,13 +66,13 @@ function AdminGate() {
       <span className="lock" aria-hidden="true">
         🔒
       </span>
-      <h2>Admin access required.</h2>
+      <h2>Admin access required</h2>
       <p>
         You're signed in as staff, so this area is off limits — attendance,
         worker approvals and settings are admin-only. Ask an administrator if
         you need something from here.
       </p>
-      <Link className="btn btn-primary" to="/">
+      <Link className="btn btn-primary" to="/projects">
         Back to projects
       </Link>
     </div>
@@ -87,8 +93,10 @@ export default function App() {
                 </RequireAuth>
               }
             >
-              <Route index element={<ProjectsPage />} />
+              <Route index element={<OverviewPage />} />
+              <Route path="projects" element={<ProjectsPage />} />
               <Route path="projects/:id" element={<GalleryPage />} />
+              <Route path="timesheets" element={<TimesheetsPage />} />
               <Route path="search" element={<SearchPage />} />
               <Route
                 path="attendance"

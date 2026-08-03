@@ -196,14 +196,14 @@ export function GalleryPage() {
   return (
     <div className="reveal">
       <SectionHeader
-        eyebrow={project?.code ?? "Project"}
-        title={project ? `${project.name}.` : "Loading project…"}
+        title={project ? project.name : "Project"}
         subtitle={
-          project?.site_address ||
-          "Every report filed against this site, newest first — filter to narrow it down."
+          project
+            ? [project.code, project.site_address].filter(Boolean).join(" · ")
+            : undefined
         }
         actions={
-          <Link className="btn btn-secondary" to="/">
+          <Link className="btn btn-secondary" to="/projects">
             All projects
           </Link>
         }

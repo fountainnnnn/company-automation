@@ -6,6 +6,7 @@
 // enters a retry storm because of an internal failure.
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { looksLikeTimesheet, type ParsedTimesheet, parseTimesheet } from "./parser.ts";
 
 const supabase = createClient(
   Deno.env.get("SUPABASE_URL")!,
@@ -127,6 +128,9 @@ interface Draft {
   project_id?: number;
   report_id?: number;
   pending_group?: string | null;
+  /** Parsed timesheet awaiting confirmation, plus the message it came from. */
+  timesheet?: ParsedTimesheet;
+  timesheet_raw?: string;
 }
 
 type SessionState =
@@ -136,7 +140,11 @@ type SessionState =
   | "awaiting_checkout_location"
   | "choosing_project_for_media"
   | "adding_note"
-  | "typing_date";
+  | "typing_date"
+  | "awaiting_timesheet"
+  | "ts_typing_date"
+  | "ts_typing_team"
+  | "ts_typing_loc";
 
 interface Session {
   chat_id: number;
@@ -476,6 +484,7 @@ const HELP_TEXT = [
   "• Send photos, videos or files — I save them as a site report.",
   "• Add a caption and it becomes the report note.",
   "• /checkin and /checkout — share your location to log your hours.",
+  "• /timesheet — send the day's hours for your team.",
   "• /project — switch the site you're reporting for.",
   "• /status — see your current site and check-in.",
 ].join("\n");
@@ -597,7 +606,17 @@ async function handleMessage(message: TgMessage): Promise<void> {
     case "choosing_project_for_media":
       await send(chatId, "Pick a project from the buttons above first.");
       return;
+    case "awaiting_timesheet":
+      return startTimesheet(chatId, session, text);
+    case "ts_typing_date":
+      return tsTypedDate(chatId, session, text);
+    case "ts_typing_team":
+      return tsTypedTeam(chatId, session, text);
+    case "ts_typing_loc":
+      return tsTypedLocation(chatId, session, text);
     default:
+      // a pasted crew list is a timesheet even without the command
+      if (looksLikeTimesheet(text)) return startTimesheet(chatId, session, text);
       await send(chatId, HELP_TEXT);
   }
 }
@@ -675,6 +694,8 @@ async function handleCommand(
       return cmdCheckin(chatId, worker, session);
     case "checkout":
       return cmdCheckout(chatId, worker, session);
+    case "timesheet":
+      return cmdTimesheet(chatId, session);
     default:
       await send(chatId, "I don't know that command. Send /help to see what I can do.");
   }
@@ -1190,6 +1211,298 @@ async function saveDateFromText(
   await send(chatId, `✅ Date set to ${await fmtDate(parsed)}.`);
 }
 
+// ---------------------------------------------------------------- timesheets
+
+const TIMESHEET_PROMPT = [
+  "Send the day's list — one line per worker.",
+  "",
+  "12/08 Team 3 Jurong",
+  "101 - 8",
+  "102 - 8.5",
+  "103 - MC",
+  "",
+  "I'll show you what I read before anything is saved.",
+].join("\n");
+
+const TIMESHEET_GONE = "That timesheet is no longer open. Send the list again.";
+
+async function cmdTimesheet(chatId: number, session: Session): Promise<void> {
+  await saveSession(session, { state: "awaiting_timesheet" });
+  await send(chatId, TIMESHEET_PROMPT, { reply_markup: REMOVE_KEYBOARD });
+}
+
+function timesheetButtons(): InlineButton[][] {
+  return [
+    [{ text: "✅ Save", callback_data: "ts:save" }],
+    [
+      { text: "📅 Change date", callback_data: "ts:date" },
+      { text: "👥 Change team", callback_data: "ts:team" },
+    ],
+    [
+      { text: "📍 Change location", callback_data: "ts:loc" },
+      { text: "✖️ Discard", callback_data: "ts:x" },
+    ],
+  ];
+}
+
+/** Telegram HTML mode: escape anything that came from a worker's message. */
+function esc(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function entryCell(entry: ParsedTimesheet["entries"][number]): string {
+  const value = entry.hours !== null ? `${entry.hours}h` : entry.absenceReason ?? "?";
+  const role = entry.role === "worker" ? "" : ` (${entry.role})`;
+  return `${entry.workerCode.padEnd(6)}${value}${role}`;
+}
+
+async function timesheetCard(sheet: ParsedTimesheet): Promise<string> {
+  const assumed = sheet.workDate === null;
+  const workDate = sheet.workDate ?? await localDate();
+
+  const head = [`📋 Timesheet — ${await fmtDate(workDate)}${assumed ? " (assumed today)" : ""}`];
+  head.push(sheet.teamNumber ? `Team ${sheet.teamNumber}` : "no team");
+  if (sheet.location) head.push(sheet.location);
+
+  const hours = sheet.entries.reduce((sum, e) => sum + (e.hours ?? 0), 0);
+  const absent = sheet.entries.filter((e) => e.absenceReason !== null).length;
+
+  const lines = [
+    esc(head.join(" · ")),
+    esc(`${sheet.entries.length} workers · ${Math.round(hours * 10) / 10} h · ${absent} absent`),
+  ];
+
+  // the roster itself goes in a <pre> block: Telegram renders it monospaced, so
+  // the code/hours columns line up instead of drifting in a proportional font
+  const rows: string[] = [];
+  for (let i = 0; i < sheet.entries.length; i += 2) {
+    const left = entryCell(sheet.entries[i]);
+    const right = sheet.entries[i + 1] ? entryCell(sheet.entries[i + 1]) : "";
+    rows.push(right ? `${left.padEnd(18)}${right}` : left);
+  }
+  lines.push(`<pre>${esc(rows.join("\n"))}</pre>`);
+
+  if (sheet.unparsed.length > 0) {
+    lines.push(
+      "⚠️ Couldn't read:",
+      `<pre>${esc(sheet.unparsed.join("\n"))}</pre>`,
+    );
+  }
+  return lines.join("\n");
+}
+
+async function sendTimesheetCard(chatId: number, sheet: ParsedTimesheet): Promise<void> {
+  await send(chatId, await timesheetCard(sheet), {
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: timesheetButtons() },
+  });
+}
+
+async function startTimesheet(chatId: number, session: Session, text: string): Promise<void> {
+  const sheet = parseTimesheet(text, await localDate(), await tz());
+
+  if (sheet.entries.length === 0) {
+    await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
+    await send(chatId, "I couldn't find any worker lines in that.\n\n" + TIMESHEET_PROMPT);
+    return;
+  }
+
+  await saveSession(session, {
+    state: "idle",
+    draft: { ...session.draft, timesheet: sheet, timesheet_raw: text.slice(0, 4000) },
+  });
+  await sendTimesheetCard(chatId, sheet);
+}
+
+/** Apply an edit to the draft and re-send the confirm card. */
+async function tsPatch(
+  chatId: number,
+  session: Session,
+  patch: Partial<ParsedTimesheet>,
+): Promise<void> {
+  const sheet = session.draft.timesheet;
+  if (!sheet) {
+    await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
+    await send(chatId, TIMESHEET_GONE);
+    return;
+  }
+  const next = { ...sheet, ...patch };
+  await saveSession(session, {
+    state: "idle",
+    draft: { ...session.draft, timesheet: next },
+  });
+  await sendTimesheetCard(chatId, next);
+}
+
+async function tsTypedDate(chatId: number, session: Session, text: string): Promise<void> {
+  const parsed = parseDate(text);
+  if (!parsed) {
+    await send(chatId, "I couldn't read that date. Use 2026-08-03 or 03/08/2026.");
+    return;
+  }
+  await tsPatch(chatId, session, { workDate: parsed });
+}
+
+function tsTypedTeam(chatId: number, session: Session, text: string): Promise<void> {
+  const team = text.trim().replace(/^team\s*/i, "").slice(0, 20).trim();
+  return tsPatch(chatId, session, { teamNumber: team || null });
+}
+
+function tsTypedLocation(chatId: number, session: Session, text: string): Promise<void> {
+  const location = text.trim().slice(0, 80);
+  return tsPatch(chatId, session, { location: location || null });
+}
+
+/** Same (work_date, team_number) already filed — team_number is nullable. */
+async function findExistingTimesheet(
+  workDate: string,
+  teamNumber: string | null,
+): Promise<{ id: number } | null> {
+  let query = supabase.from("timesheets").select("id").eq("work_date", workDate);
+  query = teamNumber === null
+    ? query.is("team_number", null)
+    : query.eq("team_number", teamNumber);
+  const { data, error } = await query.order("id").limit(1);
+  if (error) throw error;
+  return (data?.[0] as { id: number }) ?? null;
+}
+
+type SaveMode = "new" | "replace" | "add";
+
+async function tsSave(
+  chatId: number,
+  worker: Worker,
+  session: Session,
+  mode: SaveMode,
+): Promise<void> {
+  const sheet = session.draft.timesheet;
+  if (!sheet) {
+    await send(chatId, TIMESHEET_GONE);
+    return;
+  }
+
+  const workDate = sheet.workDate ?? await localDate();
+
+  if (mode !== "add") {
+    const existing = await findExistingTimesheet(workDate, sheet.teamNumber);
+    if (existing && mode === "new") {
+      await send(
+        chatId,
+        `A timesheet for ${await fmtDate(workDate)} · Team ${sheet.teamNumber ?? "—"} already exists.`,
+        {
+          reply_markup: {
+            inline_keyboard: [[
+              { text: "♻️ Replace", callback_data: "ts:repl" },
+              { text: "➕ Add anyway", callback_data: "ts:add" },
+            ]],
+          },
+        },
+      );
+      return;
+    }
+    if (existing && mode === "replace") {
+      // entries cascade with the parent row
+      const { error } = await supabase.from("timesheets").delete().eq("id", existing.id);
+      if (error) throw error;
+    }
+  }
+
+  const projectId = session.draft.project_id ?? worker.default_project_id ?? null;
+  const { data, error } = await supabase
+    .from("timesheets")
+    .insert({
+      work_date: workDate,
+      team_number: sheet.teamNumber,
+      location: sheet.location,
+      project_id: projectId,
+      submitted_by: worker.id,
+      raw_text: session.draft.timesheet_raw ?? null,
+    })
+    .select("id")
+    .single();
+  if (error) throw error;
+
+  // worker_code -> worker_id is resolved by a database trigger
+  const rows = sheet.entries.map((e) => ({
+    timesheet_id: data.id,
+    worker_code: e.workerCode,
+    hours: e.hours,
+    absence_reason: e.absenceReason,
+    role: e.role,
+  }));
+  const entriesInsert = await supabase.from("timesheet_entries").insert(rows);
+  if (entriesInsert.error) {
+    // never leave a headerless timesheet behind
+    await supabase.from("timesheets").delete().eq("id", data.id);
+    throw entriesInsert.error;
+  }
+
+  await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
+  await send(
+    chatId,
+    `✅ Timesheet saved · ${await fmtDate(workDate)} · Team ${sheet.teamNumber ?? "—"} · ${rows.length} entries`,
+  );
+}
+
+async function handleTimesheetCallback(
+  sub: string,
+  chatId: number,
+  messageId: number | undefined,
+  worker: Worker,
+  session: Session,
+): Promise<void> {
+  if (!session.draft.timesheet) {
+    await send(chatId, TIMESHEET_GONE);
+    return;
+  }
+
+  switch (sub) {
+    case "save":
+      return tsSave(chatId, worker, session, "new");
+    case "repl":
+      if (messageId) await editKeyboard(chatId, messageId, []);
+      return tsSave(chatId, worker, session, "replace");
+    case "add":
+      if (messageId) await editKeyboard(chatId, messageId, []);
+      return tsSave(chatId, worker, session, "add");
+    case "date": {
+      const rows: InlineButton[][] = [
+        [
+          { text: "Today", callback_data: "ts:d0" },
+          { text: "Yesterday", callback_data: "ts:d1" },
+        ],
+        [{ text: "✍️ Type date", callback_data: "ts:dt" }],
+      ];
+      if (messageId) await editKeyboard(chatId, messageId, rows);
+      else await send(chatId, "Which date?", { reply_markup: { inline_keyboard: rows } });
+      return;
+    }
+    case "d0":
+    case "d1":
+      if (messageId) await editKeyboard(chatId, messageId, []);
+      return tsPatch(chatId, session, { workDate: await localDate(sub === "d1" ? 1 : 0) });
+    case "dt":
+      await saveSession(session, { state: "ts_typing_date" });
+      await send(chatId, "Send the date as 2026-08-03 or 03/08/2026.");
+      return;
+    case "team":
+      await saveSession(session, { state: "ts_typing_team" });
+      await send(chatId, "Send the team, e.g. 3.");
+      return;
+    case "loc":
+      await saveSession(session, { state: "ts_typing_loc" });
+      await send(chatId, "Send the location.");
+      return;
+    case "x":
+      if (messageId) await editKeyboard(chatId, messageId, []);
+      await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
+      await send(chatId, "Discarded.");
+      return;
+    default:
+      console.error("unknown timesheet callback", sub);
+  }
+}
+
 // ---------------------------------------------------------------- callbacks
 
 async function handleCallbackQuery(query: TgCallbackQuery): Promise<void> {
@@ -1224,6 +1537,8 @@ async function handleCallbackQuery(query: TgCallbackQuery): Promise<void> {
   }
 
   switch (action) {
+    case "ts":
+      return handleTimesheetCallback(parts[1] ?? "", chatId, messageId, worker, session);
     case "pj":
       return cbPickStickyProject(chatId, messageId, session, Number(parts[1]));
     case "pjm":

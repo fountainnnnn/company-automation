@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { supabase } from "../lib/supabase";
 import { useAuth } from "../lib/auth";
 import { formatDay } from "../lib/format";
@@ -42,9 +42,22 @@ export function SearchPage() {
   const { isAdmin } = useAuth();
   const toast = useToast();
 
+  const [params] = useSearchParams();
+  const urlQuery = params.get("q") ?? "";
+
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
-  const [filters, setFilters] = useState<Filters>({ ...EMPTY_FILTERS, projectId: "" });
+  const [filters, setFilters] = useState<Filters>({
+    ...EMPTY_FILTERS,
+    projectId: "",
+    query: urlQuery,
+  });
+
+  // The topbar search lands here with ?q= — adopt it without wiping the
+  // filters the user may already have set.
+  useEffect(() => {
+    setFilters((prev) => (prev.query === urlQuery ? prev : { ...prev, query: urlQuery }));
+  }, [urlQuery]);
   // Media type is a client-side filter; keeping it out of the query key stops
   // a toggle from refetching and discarding the pages already loaded.
   const serverFilters = useMemo<Filters>(
@@ -122,11 +135,7 @@ export function SearchPage() {
 
   return (
     <div className="reveal">
-      <SectionHeader
-        eyebrow="Global search"
-        title="Find it across every site."
-        subtitle="One query over all projects — by date range, worker, media type or note text."
-      />
+      <SectionHeader title="Search" />
 
       <FilterBar
         filters={filters}

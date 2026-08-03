@@ -1,6 +1,6 @@
 import type { CSSProperties, ReactNode } from "react";
 
-/** Solid data surface — dense text never sits on a glow. */
+/** Solid white data surface — dense text never sits on glass. */
 export function Card({
   children,
   padded = true,
@@ -17,16 +17,4 @@ export function Card({
       {children}
     </div>
   );
-}
-
-const HUE_PAIRS: Array<[string, string]> = [
-  ["var(--amber)", "var(--sky)"],
-  ["var(--sky)", "var(--violet)"],
-  ["var(--violet)", "var(--amber)"],
-];
-
-/** CSS custom properties driving `.glow-card::before`, rotating per index. */
-export function glowVars(index: number): CSSProperties {
-  const [a, b] = HUE_PAIRS[index % HUE_PAIRS.length];
-  return { "--glow-a": a, "--glow-b": b } as CSSProperties;
 }

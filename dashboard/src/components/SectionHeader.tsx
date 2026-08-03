@@ -1,23 +1,21 @@
 import type { ReactNode } from "react";
+import { usePageTitle } from "../lib/pageTitle";
 
 interface Props {
-  eyebrow: string;
+  /** The plain name of the page. Rendered as the heading in the topbar. */
   title: string;
-  subtitle: string;
+  /** Only when it states a fact the user cannot infer — a count or a range. */
+  subtitle?: string;
   actions?: ReactNode;
 }
 
-export function SectionHeader({ eyebrow, title, subtitle, actions }: Props) {
+export function SectionHeader({ title, subtitle, actions }: Props) {
+  usePageTitle(title);
+  if (!subtitle && !actions) return null;
   return (
-    <header className="section-head">
-      <div className="row">
-        <div style={{ minWidth: 0, flex: 1 }}>
-          <p className="eyebrow">{eyebrow}</p>
-          <h1>{title}</h1>
-          <p className="sub">{subtitle}</p>
-        </div>
-        {actions && <div className="row row-end">{actions}</div>}
-      </div>
-    </header>
+    <div className="page-head">
+      {subtitle && <p className="sub">{subtitle}</p>}
+      {actions && <div className="page-actions">{actions}</div>}
+    </div>
   );
 }

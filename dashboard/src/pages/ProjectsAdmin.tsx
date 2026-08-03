@@ -53,9 +53,14 @@ export function ProjectsAdminPage() {
   return (
     <div className="reveal">
       <SectionHeader
-        eyebrow="Manage"
-        title="Sites and their details."
-        subtitle="Codes drive the bot's keyboards — keep them short and unambiguous."
+        title="Manage"
+        subtitle={
+          projects === null
+            ? undefined
+            : `${projects.filter((p) => p.status === "active").length} active · ${
+                projects.filter((p) => p.status !== "active").length
+              } archived`
+        }
         actions={
           <Button variant="primary" onClick={() => setCreating(true)}>
             New project

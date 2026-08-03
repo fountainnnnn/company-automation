@@ -19,8 +19,99 @@ import { Button } from "../components/Button";
 import { EmptyState } from "../components/EmptyState";
 import { SkeletonList } from "../components/Skeleton";
 import { useToast } from "../components/Toast";
+import { Modal } from "../components/Modal";
+import { SiteMap } from "../components/SiteMap";
+import type { MapPoint } from "../components/SiteMap";
 
-const SELECT = "*,workers(full_name),projects(code,name)";
+const SELECT = "*,workers(full_name),projects(code,name,site_lat,site_lng)";
+
+function coord(lat: number, lng: number): string {
+  return `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
+}
+
+/** In, out and — when the project has coordinates — the assigned site. */
+function pointsFor(row: Attendance): MapPoint[] {
+  const points: MapPoint[] = [];
+  if (row.in_lat !== null && row.in_lng !== null) {
+    points.push({
+      lat: row.in_lat,
+      lng: row.in_lng,
+      kind: "in",
+      label: "Check-in",
+      sub: formatDateTime(row.check_in_at),
+    });
+  }
+  if (row.out_lat !== null && row.out_lng !== null) {
+    points.push({
+      lat: row.out_lat,
+      lng: row.out_lng,
+      kind: "out",
+      label: "Check-out",
+      sub: formatDateTime(row.check_out_at),
+    });
+  }
+  const p = row.projects;
+  if (p && p.site_lat !== null && p.site_lng !== null) {
+    points.push({ lat: p.site_lat, lng: p.site_lng, kind: "site", label: p.code, sub: p.name });
+  }
+  return points;
+}
+
+/** One map at a time: it lives in this dialog and dies with it. */
+function MapModal({ row, onClose }: { row: Attendance; onClose: () => void }) {
+  const points = pointsFor(row);
+  const site = points.find((p) => p.kind === "site") ?? null;
+  return (
+    <Modal
+      size="wide"
+      title={`${row.workers?.full_name ?? "Unknown worker"} · ${formatDay(toSgtDay(row.check_in_at))}`}
+      onClose={onClose}
+      footer={
+        <Button variant="ghost" onClick={onClose}>
+          Close
+        </Button>
+      }
+    >
+      {points.length === 0 ? (
+        <p className="muted">No coordinates were recorded for this shift.</p>
+      ) : (
+        <>
+          <SiteMap points={points} connect height={360} />
+          <div className="map-legend">
+            <span>
+              <i className="k-in" aria-hidden="true" />
+              Check-in
+            </span>
+            {row.out_lat !== null && (
+              <span>
+                <i className="k-out" aria-hidden="true" />
+                Check-out
+              </span>
+            )}
+            {site && (
+              <span>
+                <i className="k-site" aria-hidden="true" />
+                Project site
+              </span>
+            )}
+            {row.distance_m !== null && (
+              <span className="tnum">{formatDistance(row.distance_m)}</span>
+            )}
+          </div>
+          <div className="flag-row">
+            <MapLink label="in" lat={row.in_lat} lng={row.in_lng} />
+            <MapLink label="out" lat={row.out_lat} lng={row.out_lng} />
+          </div>
+          <p className="map-coords">
+            In {row.in_lat !== null && row.in_lng !== null ? coord(row.in_lat, row.in_lng) : "—"} ·
+            Out {row.out_lat !== null && row.out_lng !== null ? coord(row.out_lat, row.out_lng) : "—"}
+            {site && ` · Site ${coord(site.lat, site.lng)}`}
+          </p>
+        </>
+      )}
+    </Modal>
+  );
+}
 
 function MapLink({
   label,
@@ -47,9 +138,11 @@ function MapLink({
 function FlagCard({
   row,
   onCleared,
+  onShowMap,
 }: {
   row: Attendance;
   onCleared: (id: string) => void;
+  onShowMap: () => void;
 }) {
   const { profile } = useAuth();
   const toast = useToast();
@@ -104,6 +197,9 @@ function FlagCard({
       </div>
 
       <div className="flag-row">
+        <Button variant="secondary" onClick={onShowMap}>
+          View map
+        </Button>
         <MapLink label="in" lat={row.in_lat} lng={row.in_lng} />
         <MapLink label="out" lat={row.out_lat} lng={row.out_lng} />
       </div>
@@ -132,6 +228,7 @@ export function AttendancePage() {
   const [day, setDay] = useState(toDateInput(new Date()));
   const [flags, setFlags] = useState<Attendance[] | null>(null);
   const [rows, setRows] = useState<Attendance[] | null>(null);
+  const [mapRow, setMapRow] = useState<Attendance | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -170,9 +267,12 @@ export function AttendancePage() {
   return (
     <div className="reveal">
       <SectionHeader
-        eyebrow="Attendance"
-        title="Who was on site, and where."
-        subtitle="Flagged check-ins need a decision; the day table below is the full trail."
+        title="Attendance"
+        subtitle={
+          flags === null
+            ? undefined
+            : `${flags.length} flag${flags.length === 1 ? "" : "s"} awaiting review`
+        }
       />
 
       <h2 className="sub-head">Flags queue</h2>
@@ -190,6 +290,7 @@ export function AttendancePage() {
               key={row.id}
               row={row}
               onCleared={(id) => setFlags((prev) => (prev ?? []).filter((f) => f.id !== id))}
+              onShowMap={() => setMapRow(row)}
             />
           ))}
         </div>
@@ -229,6 +330,7 @@ export function AttendancePage() {
                 <th>Check-out</th>
                 <th>Hours</th>
                 <th>Status</th>
+                <th>Map</th>
               </tr>
             </thead>
             <tbody>
@@ -259,8 +361,18 @@ export function AttendancePage() {
                       ) : r.check_out_at ? (
                         <StatusChip kind="ok" label="complete" />
                       ) : (
-                        <StatusChip kind="info" label="on site" pulse />
+                        <StatusChip kind="info" label="on site" />
                       )}
+                    </td>
+                    <td>
+                      <button
+                        type="button"
+                        className="btn btn-outline-ink"
+                        onClick={() => setMapRow(r)}
+                        title={`Map for ${r.workers?.full_name ?? "this shift"}`}
+                      >
+                        Map <span aria-hidden="true">📍</span>
+                      </button>
                     </td>
                   </tr>
                 );
@@ -269,6 +381,8 @@ export function AttendancePage() {
           </table>
         </div>
       )}
+
+      {mapRow && <MapModal row={mapRow} onClose={() => setMapRow(null)} />}
     </div>
   );
 }
