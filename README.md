@@ -53,7 +53,13 @@ rewrite so deep links like `/projects/2` resolve to index.html).
    (enforced in the schema, not just the flow).
 4. Check-in/out points ≥ **10 km** apart (Settings-tunable) → flagged for admin review.
    Forgotten checkouts are flagged nightly (rows older than 18 h, so night shifts are safe).
-5. **Timesheets** — paste the day's list (or use `/timesheet`). The bot recognises a roster
+5. **Group mode** — add @CLAutomationBot to a site's group chat, link it once
+   (`/link` → pick the site), and from then on every photo/video/file posted by
+   anyone lands in that site's archive, credited to the sender, acknowledged with
+   a 👍 reaction — the bot never clutters the group with replies. Rosters pasted
+   in the group save directly with a one-line confirmation. Unknown senders are
+   auto-registered as pending workers so no file is ever lost. `/unlink` to detach.
+6. **Timesheets** — paste the day's list (or use `/timesheet`). The bot recognises a roster
    automatically, e.g.:
 
    ```

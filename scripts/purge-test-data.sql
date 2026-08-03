@@ -19,6 +19,7 @@ delete from public.attendance;
 delete from public.pending_media;
 delete from public.chat_sessions;
 delete from public.project_workers;
+delete from public.group_links;
 delete from public.workers;
 delete from public.projects;
 

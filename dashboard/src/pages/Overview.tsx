@@ -182,6 +182,21 @@ function OverviewSkeleton() {
   );
 }
 
+/**
+ * Sum a daily series into 7-day buckets, newest-aligned so the last bucket is
+ * the current (possibly partial) week. Drops a leading stub week rather than
+ * showing a short bar that only looks like a decline.
+ */
+function toWeekly(daily: number[]): number[] {
+  const weeks: number[] = [];
+  for (let end = daily.length; end > 0; end -= 7) {
+    const start = Math.max(0, end - 7);
+    if (end - start < 4 && weeks.length > 0) break; // partial tail week: not comparable
+    weeks.unshift(daily.slice(start, end).reduce((s, v) => s + v, 0));
+  }
+  return weeks;
+}
+
 /** Staff see the same row without a link — the target pages are admin-only. */
 function AttnText({ to, title, sub }: { to?: string; title: string; sub: string }) {
   const body = (
@@ -243,8 +258,11 @@ function OverviewBody({
   const { stats, projects, workers, roles, mix } = data;
   const attention = stats.pending_workers > 0 || stats.open_flags > 0;
   // Sparklines reuse the series already on screen — no extra query, no invention.
-  const reportSeries = data.days.map((d) => d.reports);
-  const mediaSeries = data.days.map((d) => d.media);
+  // Bucket the daily series into weeks before it reaches the sparkline. Raw
+  // daily counts zero out every Sunday, so at sparkline size they read as noise
+  // rather than direction; weekly totals are what "is this rising?" actually means.
+  const reportSeries = toWeekly(data.days.map((d) => d.reports));
+  const mediaSeries = toWeekly(data.days.map((d) => d.media));
 
   return (
     <>

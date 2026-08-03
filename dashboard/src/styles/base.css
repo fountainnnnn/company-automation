@@ -1752,13 +1752,22 @@ table.data td.nowrap {
   display: block;
   overflow: visible;
 }
-.spark path {
-  fill: none;
-  stroke-width: 2;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  stroke-dasharray: 1;
-  animation: draw var(--t-draw) var(--ease) both;
+.spark rect {
+  transform-origin: bottom;
+  animation: spark-rise var(--t-mid) var(--ease) both;
+}
+@keyframes spark-rise {
+  from {
+    transform: scaleY(0);
+  }
+  to {
+    transform: scaleY(1);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .spark rect {
+    animation: none;
+  }
 }
 
 /* stat row (timesheets) */
