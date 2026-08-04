@@ -1,44 +1,33 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
 import {
-  CircleAlert,
-  Clock,
-  FileText,
+  ArrowUpRight,
+  Check,
+  Clock3,
+  FileImage,
   Flag,
-  Images,
-  MapPin,
+  RefreshCw,
   UserPlus,
 } from "lucide-react";
-import { supabase } from "../lib/supabase";
-import { useAuth } from "../lib/auth";
-import { Card } from "../components/Card";
-import { SectionHeader } from "../components/SectionHeader";
-import { Skeleton } from "../components/Skeleton";
 import { EmptyState } from "../components/EmptyState";
-import { StatCard } from "../components/StatCard";
+import { SectionHeader } from "../components/SectionHeader";
+import { SiteMap, type MapPoint } from "../components/SiteMap";
+import { Skeleton } from "../components/Skeleton";
+import { Sparkline } from "../components/Sparkline";
 import { useToast } from "../components/Toast";
-import { ActivityChart } from "../components/charts/ActivityChart";
-import { RankedBars } from "../components/charts/RankedBars";
-import { MediaMixBar } from "../components/charts/MediaMixBar";
-import type {
-  DayVolumeRow,
-  MediaMixRow,
-  OverviewStats,
-  ProjectVolumeRow,
-  RoleHoursRow,
-  WorkerHoursRow,
-} from "../lib/types";
+import { useAuth } from "../lib/auth";
+import { formatDayShort, formatRelative, formatTime, toSgtDay } from "../lib/format";
+import { REPORT_SELECT, signReportMedia } from "../lib/reports";
+import { supabase } from "../lib/supabase";
+import type { DayVolumeRow, OverviewStats, Project, Report } from "../lib/types";
 
 const RANGES = [7, 30, 90];
-
-interface OverviewData {
-  stats: OverviewStats;
-  days: DayVolumeRow[];
-  projects: ProjectVolumeRow[];
-  workers: WorkerHoursRow[];
-  roles: RoleHoursRow[];
-  mix: MediaMixRow[];
-}
+const FALLBACK_IMAGES = [
+  "/site-fallbacks/site-crane.webp",
+  "/site-fallbacks/site-structure.webp",
+  "/site-fallbacks/site-survey.webp",
+];
 
 const EMPTY_STATS: OverviewStats = {
   reports_7d: 0,
@@ -53,10 +42,42 @@ const EMPTY_STATS: OverviewStats = {
   hours_7d: 0,
 };
 
+interface OverviewData {
+  stats: OverviewStats;
+  days: DayVolumeRow[];
+  projects: Project[];
+  reports: Report[];
+  signedUrls: Record<string, string>;
+}
+
+interface SiteCard {
+  project: Project;
+  report: Report | undefined;
+  image: string;
+  uploaded: boolean;
+}
+
+function fallbackFor(project: Project): string {
+  const key = `${project.id}:${project.code}`;
+  const hash = Array.from(key).reduce((sum, char) => sum + char.charCodeAt(0), 0);
+  return FALLBACK_IMAGES[hash % FALLBACK_IMAGES.length];
+}
+
+function normaliseStats(row: OverviewStats | undefined): OverviewStats {
+  if (!row) return EMPTY_STATS;
+  return Object.fromEntries(
+    Object.entries(row).map(([key, value]) => [key, Number(value)]),
+  ) as unknown as OverviewStats;
+}
+
+function firstName(value: string | null | undefined): string {
+  return value?.trim().split(/\s+/)[0] || "there";
+}
+
 export function OverviewPage() {
-  const { isAdmin } = useAuth();
+  const { profile, isAdmin } = useAuth();
   const toast = useToast();
-  const [days, setDays] = useState(30);
+  const [range, setRange] = useState(30);
   const [data, setData] = useState<OverviewData | null>(null);
 
   useEffect(() => {
@@ -64,375 +85,327 @@ export function OverviewPage() {
     setData(null);
 
     void (async () => {
-      // One round trip for the whole page — six aggregates, no waterfall.
-      const [stats, byDay, byProject, byWorker, byRole, mix] = await Promise.all([
+      const [statsResult, daysResult, projectsResult, reportsResult] = await Promise.all([
         supabase.rpc("overview_stats"),
-        supabase.rpc("reports_by_day", { days }),
-        supabase.rpc("reports_by_project", { days }),
-        supabase.rpc("hours_by_worker", { days }),
-        supabase.rpc("hours_by_role", { days }),
-        supabase.rpc("media_mix", { days }),
+        supabase.rpc("reports_by_day", { days: range }),
+        supabase
+          .from("projects")
+          .select("id,code,name,site_address,site_lat,site_lng,status,created_at")
+          .eq("status", "active")
+          .order("code"),
+        supabase
+          .from("reports")
+          .select(REPORT_SELECT)
+          .order("created_at", { ascending: false })
+          .limit(24),
       ]);
-      if (!active) return;
 
-      const failed = [stats, byDay, byProject, byWorker, byRole, mix].find((r) => r.error);
+      if (!active) return;
+      const failed = [statsResult, daysResult, projectsResult, reportsResult].find(
+        (result) => result.error,
+      );
       if (failed?.error) toast.error(failed.error.message);
 
-      const statRow = (stats.data as OverviewStats[] | null)?.[0];
+      const reports = (reportsResult.data ?? []) as unknown as Report[];
+      const signedUrls = await signReportMedia(reports);
+      if (!active) return;
+
       setData({
-        stats: statRow
-          ? {
-              reports_7d: Number(statRow.reports_7d),
-              reports_30d: Number(statRow.reports_30d),
-              media_total: Number(statRow.media_total),
-              media_7d: Number(statRow.media_7d),
-              active_workers: Number(statRow.active_workers),
-              pending_workers: Number(statRow.pending_workers),
-              active_projects: Number(statRow.active_projects),
-              on_site_now: Number(statRow.on_site_now),
-              open_flags: Number(statRow.open_flags),
-              hours_7d: Number(statRow.hours_7d),
-            }
-          : EMPTY_STATS,
-        days: ((byDay.data ?? []) as DayVolumeRow[]).map((d) => ({
-          day: d.day,
-          reports: Number(d.reports),
-          media: Number(d.media),
+        stats: normaliseStats((statsResult.data as OverviewStats[] | null)?.[0]),
+        days: ((daysResult.data ?? []) as DayVolumeRow[]).map((day) => ({
+          ...day,
+          reports: Number(day.reports),
+          media: Number(day.media),
         })),
-        projects: ((byProject.data ?? []) as ProjectVolumeRow[]).map((p) => ({
-          ...p,
-          reports: Number(p.reports),
-          media: Number(p.media),
-        })),
-        workers: ((byWorker.data ?? []) as WorkerHoursRow[]).map((w) => ({
-          ...w,
-          hours: Number(w.hours),
-          shifts: Number(w.shifts),
-        })),
-        roles: ((byRole.data ?? []) as RoleHoursRow[]).map((r) => ({
-          ...r,
-          hours: Number(r.hours),
-          entries: Number(r.entries),
-        })),
-        mix: (mix.data ?? []) as MediaMixRow[],
+        projects: (projectsResult.data ?? []) as unknown as Project[],
+        reports,
+        signedUrls,
       });
     })();
 
     return () => {
       active = false;
     };
-  }, [days, toast]);
+  }, [range, toast]);
 
   return (
-    <div className="reveal">
-      <SectionHeader
-        title="Overview"
-        actions={
-          <div className="range-control" role="group" aria-label="Time range">
-            {RANGES.map((r) => (
-              <button
-                key={r}
-                className={`range-btn${r === days ? " active" : ""}`}
-                aria-pressed={r === days}
-                onClick={() => setDays(r)}
-              >
-                {r}d
-              </button>
-            ))}
-          </div>
-        }
-      />
-
-      {data === null ? (
-        <OverviewSkeleton />
-      ) : (
-        <OverviewBody data={data} isAdmin={isAdmin} days={days} />
-      )}
-    </div>
-  );
-}
-
-function OverviewSkeleton() {
-  return (
-    <div className="ov-grid" aria-busy="true" aria-label="Loading overview">
-      <div className="ov-main">
-        <div className="panel panel-p stack-tight">
-          <Skeleton height={14} width="26%" />
-          <Skeleton height={230} radius={12} />
+    <div className="command-overview reveal">
+      <SectionHeader title="Overview" />
+      <div className="command-heading">
+        <div>
+          <p className="command-kicker">Operations overview</p>
+          <h2>Good morning, {firstName(profile?.full_name)}.</h2>
+          <p className="command-summary">
+            {data?.stats.active_projects ?? 0} active sites <span aria-hidden="true">·</span>{" "}
+            Singapore
+          </p>
         </div>
-        <div className="two-up">
-          {Array.from({ length: 2 }, (_, i) => (
-            <div key={i} className="panel panel-p stack-tight">
-              <Skeleton height={14} width="34%" />
-              <Skeleton height={150} radius={12} />
-            </div>
+        <div className="command-range" role="group" aria-label="Overview time range">
+          {RANGES.map((days) => (
+            <button
+              key={days}
+              type="button"
+              aria-pressed={days === range}
+              className={days === range ? "active" : ""}
+              onClick={() => setRange(days)}
+            >
+              {days} days
+            </button>
           ))}
         </div>
       </div>
-      <div className="ov-rail">
-        {Array.from({ length: 4 }, (_, i) => (
-          <div key={i} className="panel panel-p stack-tight">
-            <Skeleton height={12} width="52%" />
-            <Skeleton height={30} width="40%" />
-            <Skeleton height={12} width="66%" />
-          </div>
-        ))}
-      </div>
+
+      {data === null ? <CommandSkeleton /> : <CommandBoard data={data} isAdmin={isAdmin} />}
     </div>
   );
 }
 
-/**
- * Sum a daily series into 7-day buckets, newest-aligned so the last bucket is
- * the current (possibly partial) week. Drops a leading stub week rather than
- * showing a short bar that only looks like a decline.
- */
-function toWeekly(daily: number[]): number[] {
-  const weeks: number[] = [];
-  for (let end = daily.length; end > 0; end -= 7) {
-    const start = Math.max(0, end - 7);
-    if (end - start < 4 && weeks.length > 0) break; // partial tail week: not comparable
-    weeks.unshift(daily.slice(start, end).reduce((s, v) => s + v, 0));
-  }
-  return weeks;
-}
-
-/** Staff see the same row without a link — the target pages are admin-only. */
-function AttnText({ to, title, sub }: { to?: string; title: string; sub: string }) {
-  const body = (
-    <>
-      <span className="t truncate">{title}</span>
-      <span className="s truncate">{sub}</span>
-    </>
-  );
-  return to ? (
-    <Link className="attn-text" to={to}>
-      {body}
-    </Link>
-  ) : (
-    <span className="attn-text">{body}</span>
-  );
-}
-
-function AttentionBanner({
-  pending,
-  flags,
-  isAdmin,
-}: {
-  pending: number;
-  flags: number;
-  isAdmin: boolean;
-}) {
-  const target = flags > 0 ? "/attendance" : "/workers";
-  const parts: string[] = [];
-  if (flags > 0) parts.push(`${flags} attendance flag${flags === 1 ? "" : "s"} open`);
-  if (pending > 0) parts.push(`${pending} worker${pending === 1 ? "" : "s"} waiting for approval`);
-
+function CommandSkeleton() {
   return (
-    <div className="banner">
-      <span className="banner-icon" aria-hidden="true">
-        <CircleAlert size={20} strokeWidth={1.75} aria-hidden="true" />
-      </span>
-      <div className="banner-text">
-        <p className="t">Needs attention</p>
-        <p className="s">{parts.join(" · ")}</p>
-      </div>
-      {isAdmin && (
-        <Link className="btn btn-white" to={target}>
-          Review now
-        </Link>
-      )}
+    <div className="command-board" aria-busy="true" aria-label="Loading operations overview">
+      <div className="command-map glass-panel"><Skeleton height={330} radius={14} /></div>
+      <div className="command-review glass-panel"><Skeleton height={330} radius={14} /></div>
+      <div className="command-metrics glass-panel"><Skeleton height={72} radius={12} /></div>
+      <div className="command-sites glass-panel"><Skeleton height={260} radius={12} /></div>
+      <div className="command-activity glass-panel"><Skeleton height={260} radius={12} /></div>
     </div>
   );
 }
 
-function OverviewBody({
-  data,
-  isAdmin,
-  days,
-}: {
-  data: OverviewData;
-  isAdmin: boolean;
-  days: number;
-}) {
-  const { stats, projects, workers, roles, mix } = data;
-  const attention = stats.pending_workers > 0 || stats.open_flags > 0;
-  // Sparklines reuse the series already on screen — no extra query, no invention.
-  // Bucket the daily series into weeks before it reaches the sparkline. Raw
-  // daily counts zero out every Sunday, so at sparkline size they read as noise
-  // rather than direction; weekly totals are what "is this rising?" actually means.
-  const reportSeries = toWeekly(data.days.map((d) => d.reports));
-  const mediaSeries = toWeekly(data.days.map((d) => d.media));
+function CommandBoard({ data, isAdmin }: { data: OverviewData; isAdmin: boolean }) {
+  const { stats } = data;
+
+  const mapPoints = useMemo<MapPoint[]>(
+    () =>
+      data.projects
+        .filter(
+          (project) =>
+            project.site_lat !== null &&
+            project.site_lng !== null &&
+            Number.isFinite(Number(project.site_lat)) &&
+            Number.isFinite(Number(project.site_lng)),
+        )
+        .map((project, index) => ({
+          lat: Number(project.site_lat),
+          lng: Number(project.site_lng),
+          kind: "site" as const,
+          number: index + 1,
+          label: `${project.code} · ${project.name}`,
+          sub: project.site_address || "Active project",
+        })),
+    [data.projects],
+  );
+
+  const siteCards = useMemo<SiteCard[]>(() => {
+    const latestByProject = new Map<string, Report>();
+    for (const report of data.reports) {
+      const key = String(report.project_id);
+      if (!latestByProject.has(key)) latestByProject.set(key, report);
+    }
+
+    return data.projects
+      .map((project) => {
+        const report = latestByProject.get(String(project.id));
+        const photo = report?.report_media?.find(
+          (media) => media.media_type === "photo" && data.signedUrls[media.storage_path],
+        );
+        return {
+          project,
+          report,
+          image: photo ? data.signedUrls[photo.storage_path] : fallbackFor(project),
+          uploaded: Boolean(photo),
+        };
+      })
+      .sort((a, b) => {
+        const at = a.report?.created_at ?? "";
+        const bt = b.report?.created_at ?? "";
+        return bt.localeCompare(at);
+      })
+      .slice(0, 3);
+  }, [data.projects, data.reports, data.signedUrls]);
+
+  const trend = data.days.slice(-12).map((day) => day.reports);
+  const mediaTrend = data.days.slice(-12).map((day) => day.media);
+  const mapped = mapPoints.length;
 
   return (
-    <>
-      {attention && (
-        <AttentionBanner
-          pending={stats.pending_workers}
-          flags={stats.open_flags}
-          isAdmin={isAdmin}
-        />
-      )}
-
-      <div className="ov-grid">
-        <div className="ov-main">
-          <Card>
-            <div className="card-head">
-              <h2 className="panel-title">Activity</h2>
-              <span className="card-head-end muted" style={{ fontSize: "0.8rem" }}>
-                Last {days} days
-              </span>
-            </div>
-            <ActivityChart data={data.days} />
-          </Card>
-
-          <div className="two-up">
-            <Card>
-              <h2 className="panel-title">Busiest sites</h2>
-              <p className="panel-sub">Reports per project</p>
-              <RankedBars
-                label={`Reports per project over the last ${days} days`}
-                items={projects.map((p) => ({
-                  key: String(p.project_id),
-                  label: p.code,
-                  title: `${p.code} — ${p.name}`,
-                  value: p.reports,
-                }))}
-                emptyTitle="No reports in this window"
-                emptyHint="Widen the range, or wait for the next site report."
-              />
-            </Card>
-
-            <Card>
-              <h2 className="panel-title">Hours by worker</h2>
-              <p className="panel-sub">Completed shifts</p>
-              {!isAdmin && workers.length === 0 ? (
-                <EmptyState
-                  title="Admin-only data"
-                  hint="Attendance hours are visible to administrators. Ask an admin if you need these numbers."
-                />
-              ) : (
-                <RankedBars
-                  label={`Hours per worker over the last ${days} days`}
-                  items={workers.map((w) => ({
-                    key: String(w.worker_id),
-                    label: w.full_name,
-                    title: `${w.full_name} — ${w.shifts} shifts`,
-                    value: w.hours,
-                  }))}
-                  format={(v) => `${v.toFixed(1)}h`}
-                  emptyTitle="No completed shifts"
-                  emptyHint="Hours appear once workers check out of a shift."
-                />
-              )}
-            </Card>
+    <div className="command-board">
+      <section className="command-map glass-panel" aria-labelledby="live-sites-title">
+        <div className="command-panel-head map-head">
+          <div>
+            <span className="live-dot" aria-hidden="true" />
+            <h3 id="live-sites-title">Live sites</h3>
           </div>
+          <span>{mapped} mapped of {data.projects.length} active</span>
+        </div>
+        <SiteMap points={mapPoints} height={330} className="overview-site-map" />
+      </section>
 
-          <Card>
-            <h2 className="panel-title">Hours by role</h2>
-            <p className="panel-sub">Timesheet hours per trade</p>
-            <RankedBars
-              label={`Timesheet hours per role over the last ${days} days`}
-              items={roles.map((r) => ({
-                key: r.role,
-                label: r.role.charAt(0).toUpperCase() + r.role.slice(1),
-                title: `${r.role} — ${r.entries} entries`,
-                value: r.hours,
-              }))}
-              format={(v) => `${v.toFixed(1)}h`}
-              emptyTitle="No timesheet hours yet"
-              emptyHint="Hours appear once supervisors send a daily roster from Telegram."
+      <ReviewQueue stats={stats} isAdmin={isAdmin} />
+
+      <section className="command-metrics glass-panel" aria-label="Today at a glance">
+        <div className="metric-intro">
+          <strong>Today</strong>
+          <span>{formatDayShort(toSgtDay(new Date()))}</span>
+        </div>
+        <Metric label="Workers on site" value={String(stats.on_site_now)} sub={`${stats.active_workers} active`} />
+        <Metric label="Reports this week" value={String(stats.reports_7d)} sub={`${stats.reports_30d} in 30d`} trend={trend} />
+        <Metric label="Hours logged" value={stats.hours_7d.toFixed(1)} sub="last 7 days" />
+        <Metric label="Files received" value={String(stats.media_7d)} sub={`${stats.media_total} total`} trend={mediaTrend} />
+      </section>
+
+      <section className="command-sites glass-panel" aria-labelledby="latest-sites-title">
+        <div className="command-panel-head">
+          <h3 id="latest-sites-title">Latest from site</h3>
+          <Link to="/projects">View all site activity <ArrowUpRight size={15} aria-hidden="true" /></Link>
+        </div>
+        {siteCards.length === 0 ? (
+          <EmptyState title="No active sites yet" hint="Create a project to begin the live site feed." />
+        ) : (
+          <div className="site-card-row">
+            {siteCards.map(({ project, report, image, uploaded }) => (
+              <Link className="site-visual" to={`/projects/${project.id}`} key={project.id}>
+                <img src={image} alt={`${project.name} construction site`} />
+                <div className="site-visual-body">
+                  <div>
+                    <strong>{project.code}</strong>
+                    <span className={`source-badge${uploaded ? " uploaded" : ""}`}>
+                      {uploaded ? "Site upload" : "Project cover"}
+                    </span>
+                  </div>
+                  <p>{project.name}</p>
+                  <span>
+                    {report?.workers?.full_name || "No report yet"}
+                    {report ? ` · ${formatTime(report.created_at)}` : ""}
+                  </span>
+                </div>
+              </Link>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section className="command-activity glass-panel" aria-labelledby="activity-title">
+        <div className="command-panel-head">
+          <h3 id="activity-title">Activity timeline</h3>
+          <Link to="/search">View full timeline <ArrowUpRight size={15} aria-hidden="true" /></Link>
+        </div>
+        {data.reports.length === 0 ? (
+          <EmptyState title="No reports yet" hint="New Telegram submissions will appear here." />
+        ) : (
+          <ol className="command-timeline">
+            {data.reports.slice(0, 5).map((report) => (
+              <li key={report.id}>
+                <span className="timeline-icon"><FileImage size={15} aria-hidden="true" /></span>
+                <time dateTime={report.created_at}>{formatTime(report.created_at)}</time>
+                <div>
+                  <Link to={`/projects/${report.project_id}`}>
+                    {report.projects?.code || "Site"} report submitted
+                  </Link>
+                  <span>{report.workers?.full_name || "Telegram submission"} · {formatRelative(report.created_at)}</span>
+                </div>
+              </li>
+            ))}
+          </ol>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function ReviewQueue({ stats, isAdmin }: { stats: OverviewStats; isAdmin: boolean }) {
+  const clear = stats.open_flags === 0 && stats.pending_workers === 0;
+  return (
+    <section className="command-review glass-panel" aria-labelledby="review-title">
+      <div className="command-panel-head">
+        <h3 id="review-title">Needs review</h3>
+        {isAdmin && <Link to="/attendance">View all</Link>}
+      </div>
+      {clear ? (
+        <div className="review-clear">
+          <span><Check size={19} aria-hidden="true" /></span>
+          <strong>Queue clear</strong>
+          <p>No attendance flags or worker approvals are waiting.</p>
+        </div>
+      ) : (
+        <div className="review-list">
+          {stats.open_flags > 0 && (
+            <ReviewItem
+              icon={<Flag size={18} aria-hidden="true" />}
+              count={stats.open_flags}
+              label="attendance flags"
+              detail="Location checks need review"
+              to={isAdmin ? "/attendance" : undefined}
+              tone="flag"
             />
-          </Card>
-
-          <Card>
-            <h2 className="panel-title">Media mix</h2>
-            <p className="panel-sub">What arrived in the last {days} days</p>
-            <MediaMixBar rows={mix} />
-          </Card>
+          )}
+          {stats.pending_workers > 0 && (
+            <ReviewItem
+              icon={<UserPlus size={18} aria-hidden="true" />}
+              count={stats.pending_workers}
+              label="pending workers"
+              detail="Telegram registrations"
+              to={isAdmin ? "/workers" : undefined}
+              tone="warn"
+            />
+          )}
         </div>
+      )}
+      <div className="review-updated"><RefreshCw size={13} aria-hidden="true" /> Live data</div>
+    </section>
+  );
+}
 
-        <div className="ov-rail">
-          <StatCard
-            label="Reports this week"
-            value={String(stats.reports_7d)}
-            sub={`${stats.reports_30d} in the last 30 days`}
-            icon={<FileText size={20} strokeWidth={1.75} aria-hidden="true" />}
-            spark={reportSeries}
-            sparkColor="var(--series-1)"
-          />
-          <StatCard
-            label="Photos & files"
-            value={String(stats.media_total)}
-            sub={`+${stats.media_7d} this week`}
-            icon={<Images size={20} strokeWidth={1.75} aria-hidden="true" />}
-            spark={mediaSeries}
-            sparkColor="var(--series-2)"
-          />
-          <StatCard
-            label="On site now"
-            value={String(stats.on_site_now)}
-            sub={`${stats.active_workers} active workers`}
-            tone={stats.on_site_now > 0 ? "ok" : "blue"}
-            to={isAdmin ? "/attendance" : undefined}
-            linkLabel="Open attendance"
-            icon={<MapPin size={20} strokeWidth={1.75} aria-hidden="true" />}
-          />
-          <StatCard
-            label="Hours logged (7d)"
-            value={stats.hours_7d.toFixed(1)}
-            sub={`across ${stats.active_projects} active sites`}
-            icon={<Clock size={20} strokeWidth={1.75} aria-hidden="true" />}
-            to="/timesheets"
-            linkLabel="Open timesheets"
-          />
-
-          <Card>
-            <div className="card-head" style={{ marginBottom: 4 }}>
-              <h2 className="panel-title">Needs attention</h2>
-              {isAdmin && attention && (
-                <Link className="btn btn-ghost card-head-end" to="/attendance">
-                  View all
-                </Link>
-              )}
-            </div>
-            {!attention ? (
-              <p className="panel-sub" style={{ marginBottom: 0 }}>
-                No pending approvals and no open attendance flags
-              </p>
-            ) : (
-              <ul className="attn-list">
-                {stats.open_flags > 0 && (
-                  <li className="attn-row">
-                    <span className="attn-icon flag" aria-hidden="true">
-                      <Flag size={18} strokeWidth={1.75} aria-hidden="true" />
-                    </span>
-                    <AttnText
-                      to={isAdmin ? "/attendance" : undefined}
-                      title="Attendance flags to review"
-                      sub="Check-ins outside the allowed distance"
-                    />
-                    <span className="attn-meta">{stats.open_flags} open</span>
-                  </li>
-                )}
-                {stats.pending_workers > 0 && (
-                  <li className="attn-row">
-                    <span className="attn-icon warn" aria-hidden="true">
-                      <UserPlus size={18} strokeWidth={1.75} aria-hidden="true" />
-                    </span>
-                    <AttnText
-                      to={isAdmin ? "/workers" : undefined}
-                      title="Worker approvals waiting"
-                      sub="New Telegram registrations"
-                    />
-                    <span className="attn-meta">{stats.pending_workers} pending</span>
-                  </li>
-                )}
-              </ul>
-            )}
-          </Card>
-        </div>
+function ReviewItem({
+  icon,
+  count,
+  label,
+  detail,
+  to,
+  tone,
+}: {
+  icon: ReactNode;
+  count: number;
+  label: string;
+  detail: string;
+  to?: string;
+  tone: "flag" | "warn";
+}) {
+  return (
+    <div className="review-item">
+      <span className={`review-icon ${tone}`}>{icon}</span>
+      <div>
+        <strong>{count} {label}</strong>
+        <span>{detail}</span>
       </div>
-    </>
+      {to && <Link to={to}>Review</Link>}
+    </div>
+  );
+}
+
+function Metric({
+  label,
+  value,
+  sub,
+  trend,
+}: {
+  label: string;
+  value: string;
+  sub: string;
+  trend?: number[];
+}) {
+  return (
+    <div className="command-metric">
+      <div>
+        <strong>{value}</strong>
+        <span>{label}</span>
+        <small>{sub}</small>
+      </div>
+      {trend && trend.length > 1 ? (
+        <Sparkline values={trend} color="var(--blue)" title={`${label} trend`} />
+      ) : (
+        <Clock3 size={18} aria-hidden="true" />
+      )}
+    </div>
   );
 }

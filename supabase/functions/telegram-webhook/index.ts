@@ -163,6 +163,8 @@ interface Report {
   worker_id: number;
   report_date: string;
   note: string | null;
+  /** Human-facing record id, `CL-YYYYMMDD-NNN`, assigned by a database trigger. */
+  job_ref: string;
 }
 
 interface Attendance {
@@ -359,12 +361,18 @@ function editKeyboard(chatId: number, messageId: number, rows: InlineButton[][])
  * button was tapped, so blanking the keyboard leaves a question hanging with no
  * visible reply. Replacing the text keeps the chat readable as a transcript.
  */
-function resolvePrompt(chatId: number, messageId: number, text: string) {
+function resolvePrompt(
+  chatId: number,
+  messageId: number,
+  text: string,
+  extra: Record<string, unknown> = {},
+) {
   return tg("editMessageText", {
     chat_id: chatId,
     message_id: messageId,
     text,
     reply_markup: { inline_keyboard: [] },
+    ...extra,
   });
 }
 
@@ -416,7 +424,9 @@ const MAIN_KEYBOARD = {
     // site work first — it's the everyday job; attendance is its own thing
     [{ text: "📷 Send records" }, { text: "📋 Timesheet" }],
     [{ text: "🕘 Check in" }, { text: "🕔 Check out" }],
-    [{ text: "ℹ️ Status" }, { text: "❓ Help" }],
+    // "My day" is the worker's own read-only view — the half that makes this
+    // feel like an application rather than a drop box
+    [{ text: "ℹ️ Status" }, { text: "📄 My day" }],
   ],
   resize_keyboard: true,
   is_persistent: true,
@@ -431,6 +441,8 @@ function buttonCommand(text: string): string | null {
     checkout: "checkout",
     timesheet: "timesheet",
     status: "status",
+    myday: "today",
+    // /help stays a command even though the button gave up its slot
     help: "help",
   };
   return map[key] ?? null;
@@ -462,15 +474,31 @@ async function fmtDate(isoDate: string): Promise<string> {
   }).format(d);
 }
 
-/** Today (or today minus `daysBack`) as YYYY-MM-DD in the configured timezone. */
-async function localDate(daysBack = 0): Promise<string> {
-  const d = new Date(Date.now() - daysBack * 86_400_000);
+/** "4 Aug 2026" — cards carry the year, one-liners don't. */
+async function fmtDateFull(isoDate: string): Promise<string> {
+  const d = new Date(`${isoDate}T12:00:00Z`);
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: await tz(),
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+  }).format(d);
+}
+
+/** The calendar date an instant falls on, in the configured timezone. */
+async function localDateOf(when: Date | string): Promise<string> {
+  const d = typeof when === "string" ? new Date(when) : when;
   return new Intl.DateTimeFormat("en-CA", {
     timeZone: await tz(),
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
   }).format(d);
+}
+
+/** Today (or today minus `daysBack`) as YYYY-MM-DD in the configured timezone. */
+function localDate(daysBack = 0): Promise<string> {
+  return localDateOf(new Date(Date.now() - daysBack * 86_400_000));
 }
 
 function fmtDuration(ms: number): string {
@@ -632,6 +660,61 @@ async function projectKeyboard(
   ]);
 }
 
+// ---------------------------------------------------------------- presentation
+//
+// A chat is a terrible place to read a form, so anything with more than one
+// fact in it is rendered as a card: a bold title, then a <pre> block whose
+// monospace font is the only way to get key/value rows to line up on a phone.
+// Everything interpolated goes through esc() — a worker's description is
+// attacker-controlled text and must never be able to close a tag.
+
+/** Telegram HTML mode: escape anything that came from a worker's message. */
+function esc(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Widest label the card grid allows; wider wraps on a narrow phone. */
+const CARD_LABEL_WIDTH = 13;
+
+/**
+ * Bold title, a <pre> grid of label/value rows, an optional footer beneath it.
+ * Every message that states more than one fact is built from this.
+ */
+function card(title: string, rows: [string, string][], footer?: string): string {
+  const grid = rows
+    .map(([label, value]) => `${esc(label.padEnd(CARD_LABEL_WIDTH))}${esc(oneLine(value))}`)
+    .join("\n");
+  const out = [`<b>${esc(title)}</b>`, `<pre>${grid}</pre>`];
+  if (footer) out.push(esc(footer));
+  return out.join("\n");
+}
+
+/** Collapse to a single line and cap it — a card row must not wrap or split. */
+function oneLine(text: string, max = 60): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
+function ordinal(n: number): string {
+  const teens = n % 100;
+  if (teens >= 11 && teens <= 13) return `${n}th`;
+  const last = n % 10;
+  return `${n}${last === 1 ? "st" : last === 2 ? "nd" : last === 3 ? "rd" : "th"}`;
+}
+
+/** "3 photos" / "1 video" / "2 files" — mixed kinds collapse to "files". */
+function mediaLabel(types: string[]): string {
+  const n = types.length;
+  if (n === 0) return "none";
+  const plural = n === 1 ? "" : "s";
+  const kinds = new Set(types);
+  if (kinds.size === 1) {
+    if (types[0] === "photo") return `${n} photo${plural}`;
+    if (types[0] === "video") return `${n} video${plural}`;
+  }
+  return `${n} file${plural}`;
+}
+
 // ---------------------------------------------------------------- messages
 
 // Three independent jobs. Workers kept assuming one had to precede another, so
@@ -651,6 +734,9 @@ const HELP_TEXT = [
   "(W101 - 8)",
   "(W104 - MC)",
   "",
+  "📄 MY DAY",
+  "Everything you've logged today, with your hours. Read-only.",
+  "",
   "Use the buttons below — no commands to remember.",
 ].join("\n");
 
@@ -662,43 +748,158 @@ function reportButtons(reportId: number): InlineButton[][] {
   ];
 }
 
-async function sendReportConfirmation(chatId: number, report: Report, code: string) {
-  await send(chatId, `✅ Saved → ${code} · ${await fmtDate(report.report_date)}`, {
+/** Everything a record card states, gathered in one shape. */
+interface RecordCard {
+  jobRef: string;
+  reportDate: string;
+  note: string | null;
+  code: string;
+  name: string;
+  mediaTypes: string[];
+}
+
+function siteLine(c: RecordCard): string {
+  return c.name ? `${c.code} — ${c.name}` : c.code;
+}
+
+/** One round trip for a record and everything shown alongside it. */
+async function loadRecordCard(reportId: number): Promise<RecordCard | null> {
+  const { data, error } = await supabase
+    .from("reports")
+    .select("id, job_ref, report_date, note, projects(code, name), report_media(media_type)")
+    .eq("id", reportId)
+    .maybeSingle();
+  if (error || !data) return null;
+
+  const row = data as {
+    job_ref: string | null;
+    report_date: string;
+    note: string | null;
+    projects?: { code?: string; name?: string } | null;
+    report_media?: { media_type: string }[] | null;
+  };
+  return {
+    jobRef: row.job_ref ?? "—",
+    reportDate: row.report_date,
+    note: row.note,
+    code: row.projects?.code ?? "site",
+    name: row.projects?.name ?? "",
+    mediaTypes: (row.report_media ?? []).map((m) => m.media_type),
+  };
+}
+
+/** How many records this worker has filed today — the receipt's human touch. */
+async function recordsToday(workerId: number): Promise<number> {
+  const { count, error } = await supabase
+    .from("reports")
+    .select("id", { count: "exact", head: true })
+    .eq("worker_id", workerId)
+    .eq("report_date", await localDate());
+  if (error) {
+    console.error("daily tally failed", error);
+    return 0;
+  }
+  return count ?? 0;
+}
+
+/** The end of a record: what was filed, where it went, and how the day is going. */
+async function receiptCard(c: RecordCard, tally: number): Promise<string> {
+  const rows: [string, string][] = [
+    ["Ref", c.jobRef],
+    ["Site", siteLine(c)],
+    ["Date", await fmtDateFull(c.reportDate)],
+    ["Description", c.note ? c.note : "—"],
+  ];
+  if (c.mediaTypes.length > 0) rows.push(["Files", mediaLabel(c.mediaTypes)]);
+
+  const footer = [
+    c.name ? `Saved to the ${c.name} archive.` : "Saved to the site archive.",
+    tally > 0 ? `That's your ${ordinal(tally)} record today. 💪` : "",
+  ].filter(Boolean).join("\n");
+  return card("🎉 Record saved", rows, footer);
+}
+
+/** Receipt for a record we already hold in memory — no re-read of the row. */
+async function sendReportConfirmation(
+  chatId: number,
+  report: Report,
+  project: Project,
+  workerId: number,
+  mediaTypes: string[],
+): Promise<void> {
+  const c: RecordCard = {
+    jobRef: report.job_ref ?? "—",
+    reportDate: report.report_date,
+    note: report.note,
+    code: project.code,
+    name: project.name,
+    mediaTypes,
+  };
+  await send(chatId, await receiptCard(c, await recordsToday(workerId)), {
+    parse_mode: "HTML",
     reply_markup: { inline_keyboard: reportButtons(report.id) },
   });
+}
+
+/**
+ * The site question, led by what the bot already knows. Seeing date, time and
+ * name filled in before the one blank field is what makes a single question
+ * feel like the end of a form instead of the start of one.
+ */
+async function newRecordPrompt(
+  title: string,
+  worker: Worker,
+  mediaTypes: string[] | null,
+): Promise<string> {
+  const rows: [string, string][] = [
+    ["Date", await fmtDateFull(await localDate())],
+    ["Time", await fmtTime(new Date())],
+    ["Filed by", worker.full_name],
+  ];
+  if (mediaTypes) rows.push(["Files", mediaLabel(mediaTypes)]);
+  return `${card(title, rows)}\n📁 Which site is this for?`;
 }
 
 /**
  * Always ask for a description after files land, but never block on it — an
  * unlabelled photo is far worse than an empty note, and a worker on scaffolding
  * needs one tap to move on. Typing the answer or tapping Skip both end here.
+ *
+ * The card leads with what the bot captured by itself, so the one question it
+ * does ask reads as the only thing left rather than the start of a form.
  */
 async function askForDetails(
   chatId: number,
   session: Session,
   report: Report,
-  code: string,
-  fileCount: number,
+  project: Project,
+  worker: Worker,
+  mediaTypes: string[],
 ): Promise<void> {
   await saveSession(session, {
     state: "adding_note",
     draft: { ...session.draft, report_id: report.id },
   });
-  const files = `${fileCount} file${fileCount === 1 ? "" : "s"}`;
-  await send(
-    chatId,
-    `✅ ${files} saved → ${code} · ${await fmtDate(report.report_date)}\n\n` +
-      `📝 What's this about? Type a short description — or tap Skip.`,
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "⏭ Skip — no description", callback_data: `nskip:${report.id}` }],
-          // wrong site is caught here, at the moment they can still see the batch
-          [{ text: "📁 Wrong site? Move it", callback_data: `rp:${report.id}` }],
-        ],
-      },
+
+  const rows: [string, string][] = [
+    ["Site", `${project.code} — ${project.name}`],
+    ["Date", `${await fmtDateFull(report.report_date)}, ${await fmtTime(new Date())}`],
+    ["Filed by", worker.full_name],
+    ["Files", mediaLabel(mediaTypes)],
+  ];
+  const body = card(`📋 Record ${report.job_ref ?? ""}`.trim(), rows, "✅ Captured automatically — nothing to type.") +
+    "\n\n📝 What's this about? Type a short description, or tap Skip.";
+
+  await send(chatId, body, {
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "⏭ Skip — no description", callback_data: `nskip:${report.id}` }],
+        // wrong site is caught here, at the moment they can still see the batch
+        [{ text: "📁 Wrong site? Move it", callback_data: `rp:${report.id}` }],
+      ],
     },
-  );
+  });
 }
 
 // ---------------------------------------------------------------- entrypoint
@@ -1134,7 +1335,7 @@ async function findRecentGroupReport(
   const since = new Date(Date.now() - GROUP_REPORT_WINDOW_MS).toISOString();
   const { data, error } = await supabase
     .from("reports")
-    .select("id, project_id, worker_id, report_date, note")
+    .select("id, project_id, worker_id, report_date, note, job_ref")
     .eq("worker_id", workerId)
     .eq("project_id", projectId)
     .is("album_group_id", null)
@@ -1376,6 +1577,8 @@ async function handleCommand(
       return cmdSend(chatId, session);
     case "status":
       return cmdStatus(chatId, worker, session);
+    case "today":
+      return cmdToday(chatId, worker);
     case "checkin":
       return cmdCheckin(chatId, worker, session);
     case "checkout":
@@ -1421,7 +1624,8 @@ async function startTextRecord(
     state: "choosing_project_for_media",
     draft: { ...resetDraft(session.draft), pending_note: text.slice(0, 2000) },
   });
-  await send(chatId, "📁 Which site is this for?", {
+  await send(chatId, await newRecordPrompt("📝 New record", worker, null), {
+    parse_mode: "HTML",
     reply_markup: { inline_keyboard: rows },
   });
 }
@@ -1434,6 +1638,115 @@ async function cmdStatus(chatId: number, worker: Worker, _session: Session): Pro
       ? `🕘 Checked in since ${await fmtTime(open.check_in_at)}`
       : "🕘 Not checked in",
     { reply_markup: MAIN_KEYBOARD },
+  );
+}
+
+/** Newest attendance row, open or closed — `/today` needs the closed one too. */
+async function latestAttendance(
+  workerId: number,
+): Promise<{ check_in_at: string; check_out_at: string | null; flags: string[] | null } | null> {
+  const { data, error } = await supabase
+    .from("attendance")
+    .select("check_in_at, check_out_at, flags")
+    .eq("worker_id", workerId)
+    .order("check_in_at", { ascending: false })
+    .limit(1);
+  if (error) throw error;
+  return (data?.[0] as { check_in_at: string; check_out_at: string | null; flags: string[] | null }) ??
+    null;
+}
+
+/** The attendance line on the day card, in the worker's own words. */
+async function attendanceRows(workerId: number): Promise<[string, string][]> {
+  const att = await latestAttendance(workerId);
+  if (!att || (await localDateOf(att.check_in_at)) !== (await localDate())) {
+    return [["Status", "Not checked in"]];
+  }
+  const rows: [string, string][] = [["Checked in", await fmtTime(att.check_in_at)]];
+  if (att.check_out_at) {
+    const worked = fmtDuration(
+      new Date(att.check_out_at).getTime() - new Date(att.check_in_at).getTime(),
+    );
+    rows.push(["Status", `Checked out ${await fmtTime(att.check_out_at)} · ${worked}`]);
+  } else if ((att.flags ?? []).includes("no_checkout")) {
+    rows.push(["Status", "No check-out recorded"]);
+  } else {
+    rows.push([
+      "Status",
+      `On site (${fmtDuration(Date.now() - new Date(att.check_in_at).getTime())})`,
+    ]);
+  }
+  return rows;
+}
+
+/** How many records the day card lists before it stops. */
+const TODAY_LIST_LIMIT = 8;
+
+/**
+ * The worker's own view of their day. Read-only on purpose: a record of work is
+ * only trusted if the person who filed it can see it back, and nothing here
+ * writes, so it is safe to tap at any point in any flow.
+ */
+async function cmdToday(chatId: number, worker: Worker): Promise<void> {
+  const today = await localDate();
+  const [reports, attRows] = await Promise.all([
+    supabase
+      .from("reports")
+      .select("id, job_ref, note, created_at, projects(code), report_media(media_type)")
+      .eq("worker_id", worker.id)
+      .eq("report_date", today)
+      .order("created_at", { ascending: false }),
+    attendanceRows(worker.id),
+  ]);
+  if (reports.error) throw reports.error;
+
+  const rows = ((reports.data ?? []) as {
+    job_ref: string | null;
+    note: string | null;
+    projects?: { code?: string } | null;
+    report_media?: { media_type: string }[] | null;
+  }[]).map((r) => ({
+    jobRef: r.job_ref ?? "—",
+    note: r.note,
+    code: r.projects?.code ?? "site",
+    types: (r.report_media ?? []).map((m) => m.media_type),
+  }));
+
+  const title = `📄 Your day — ${await fmtDateFull(today)}`;
+
+  if (rows.length === 0) {
+    await send(
+      chatId,
+      card(title, attRows, "Nothing logged yet. Tap 📷 Send records when you've got something."),
+      { parse_mode: "HTML", reply_markup: MAIN_KEYBOARD },
+    );
+    return;
+  }
+
+  const allTypes = rows.flatMap((r) => r.types);
+  const photos = allTypes.filter((t) => t === "photo").length;
+  const summary: [string, string][] = [
+    ["Records", String(rows.length)],
+    allTypes.length === photos
+      ? ["Photos", String(photos)]
+      : ["Files", String(allTypes.length)],
+    ...attRows,
+  ];
+
+  const listed = rows.slice(0, TODAY_LIST_LIMIT).map((r) => {
+    const parts = [esc(r.jobRef), esc(r.code)];
+    if (r.types.length > 0) parts.push(esc(mediaLabel(r.types)));
+    parts.push(r.note ? `“${esc(oneLine(r.note, 40))}”` : "no description");
+    return `• ${parts.join(" · ")}`;
+  });
+  if (rows.length > listed.length) {
+    listed.push(`• …and ${rows.length - listed.length} more`);
+  }
+
+  await send(
+    chatId,
+    `${card(title, summary)}\nRecords today:\n${listed.join("\n")}`,
+    { parse_mode: "HTML", reply_markup: MAIN_KEYBOARD },
   );
 }
 
@@ -1538,9 +1851,12 @@ async function doCheckin(
   // Attendance only. Where photos file is a separate, worker-chosen setting and
   // is deliberately not mentioned here — conflating the two is what made people
   // think they had to check in before they could send anything.
-  const lines = [`✅ Checked in · ${await fmtTime(data.check_in_at)}`];
-  if (nearest) lines.push(`📍 ${nearest.code} — ${nearest.name}`);
-  await send(chatId, lines.join("\n"), { reply_markup: MAIN_KEYBOARD });
+  const rows: [string, string][] = [["Time", await fmtTime(data.check_in_at)]];
+  if (nearest) rows.push(["Location", `${nearest.code} — ${nearest.name}`]);
+  await send(chatId, card("✅ Checked in", rows), {
+    parse_mode: "HTML",
+    reply_markup: MAIN_KEYBOARD,
+  });
 }
 
 async function doCheckout(
@@ -1581,7 +1897,17 @@ async function doCheckout(
   await saveSession(session, { state: "idle" });
 
   const worked = fmtDuration(checkOutAt.getTime() - new Date(open.check_in_at).getTime());
-  await send(chatId, `✅ Checked out · ${await fmtTime(checkOutAt)} · on site ${worked}`, {
+  const rows: [string, string][] = [
+    ["Time", await fmtTime(checkOutAt)],
+    ["Duration", worked],
+  ];
+  // States the distance, never the review flag: whether a shift gets looked at
+  // is an admin matter, and telling the worker turns it into an accusation.
+  const footer = farApart
+    ? `Logged ${(distance / 1000).toFixed(1)} km from where you checked in.`
+    : undefined;
+  await send(chatId, card("✅ Checked out", rows, footer), {
+    parse_mode: "HTML",
     reply_markup: MAIN_KEYBOARD,
   });
 }
@@ -1683,7 +2009,7 @@ function extractMedia(message: TgMessage): MediaDescriptor | null {
 async function ownedReport(reportId: number, workerId: number): Promise<Report | null> {
   const { data, error } = await supabase
     .from("reports")
-    .select("id, project_id, worker_id, report_date, note")
+    .select("id, project_id, worker_id, report_date, note, job_ref")
     .eq("id", reportId)
     .eq("worker_id", workerId)
     .maybeSingle();
@@ -1697,7 +2023,7 @@ const NOT_YOURS = "That report was filed by someone else — only they can edit 
 async function findAlbumReport(groupId: string): Promise<Report | null> {
   const { data, error } = await supabase
     .from("reports")
-    .select("id, project_id, worker_id, report_date, note")
+    .select("id, project_id, worker_id, report_date, note, job_ref")
     .eq("album_group_id", groupId)
     .maybeSingle();
   if (error) throw error;
@@ -1765,9 +2091,21 @@ async function handleIncomingMedia(
       state: "choosing_project_for_media",
       draft: { ...session.draft, pending_group: media.media_group_id },
     });
-    await send(chatId, "📁 Which site is this for?", {
-      reply_markup: { inline_keyboard: rows },
-    });
+    // Read the batch back rather than assuming one file: album parts land in
+    // parallel, so by now more may already be waiting. Only ever runs on the
+    // first part of a batch — the rest take the silent path above.
+    const waiting = await supabase
+      .from("pending_media")
+      .select("media")
+      .eq("chat_id", chatId);
+    const types = ((waiting.data ?? []) as { media: MediaDescriptor }[])
+      .map((p) => p.media?.media_type)
+      .filter(Boolean);
+    await send(
+      chatId,
+      await newRecordPrompt("📷 New record", worker, types.length > 0 ? types : [media.media_type]),
+      { parse_mode: "HTML", reply_markup: { inline_keyboard: rows } },
+    );
   }
 }
 
@@ -1790,7 +2128,7 @@ async function createReport(
       note: note && note.trim() ? note.trim() : null,
       album_group_id: albumGroupId,
     })
-    .select("id, project_id, worker_id, report_date, note")
+    .select("id, project_id, worker_id, report_date, note, job_ref")
     .single();
   if (!error) return { report: data as Report, created: true };
 
@@ -1882,9 +2220,17 @@ async function saveNoteFromText(
 
   await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
   // hand back the finished card so they can still fix the date or site
-  await send(chatId, "✅ Description saved.", {
+  await send(chatId, await recordReceipt(reportId, worker.id), {
+    parse_mode: "HTML",
     reply_markup: { inline_keyboard: reportButtons(reportId) },
   });
+}
+
+/** Receipt for a record we only hold the id of: read it back, then tally. */
+async function recordReceipt(reportId: number, workerId: number): Promise<string> {
+  const [c, tally] = await Promise.all([loadRecordCard(reportId), recordsToday(workerId)]);
+  if (!c) return "✅ Saved.";
+  return await receiptCard(c, tally);
 }
 
 /** "Skip" on the details prompt: close it out, leave the note null. */
@@ -1892,18 +2238,23 @@ async function cbSkipDetails(
   chatId: number,
   messageId: number | undefined,
   session: Session,
+  worker: Worker,
   reportId: number,
 ): Promise<void> {
   await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
+  const text = await recordReceipt(reportId, worker.id);
   if (messageId) {
+    // the question becomes its own answer, so the chat reads as a transcript
     await tg("editMessageText", {
       chat_id: chatId,
       message_id: messageId,
-      text: "✅ Saved without a description.",
+      text,
+      parse_mode: "HTML",
       reply_markup: { inline_keyboard: reportButtons(reportId) },
     });
   } else {
-    await send(chatId, "✅ Saved without a description.", {
+    await send(chatId, text, {
+      parse_mode: "HTML",
       reply_markup: { inline_keyboard: reportButtons(reportId) },
     });
   }
@@ -2005,11 +2356,6 @@ function timesheetButtons(): InlineButton[][] {
   ];
 }
 
-/** Telegram HTML mode: escape anything that came from a worker's message. */
-function esc(text: string): string {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
 function entryCell(entry: ParsedTimesheet["entries"][number]): string {
   const value = entry.hours !== null ? `${entry.hours}h` : entry.absenceReason ?? "?";
   const role = entry.role === "worker" ? "" : ` (${entry.role})`;
@@ -2020,17 +2366,21 @@ async function timesheetCard(sheet: ParsedTimesheet): Promise<string> {
   const assumed = sheet.workDate === null;
   const workDate = sheet.workDate ?? await localDate();
 
-  const head = [`📋 Timesheet — ${await fmtDate(workDate)}${assumed ? " (assumed today)" : ""}`];
-  head.push(sheet.teamNumber ? `Team ${sheet.teamNumber}` : "no team");
-  if (sheet.location) head.push(sheet.location);
-
   const hours = sheet.entries.reduce((sum, e) => sum + (e.hours ?? 0), 0);
   const absent = sheet.entries.filter((e) => e.absenceReason !== null).length;
 
-  const lines = [
-    esc(head.join(" · ")),
-    esc(`${sheet.entries.length} workers · ${Math.round(hours * 10) / 10} h · ${absent} absent`),
+  const summary: [string, string][] = [
+    ["Date", `${await fmtDateFull(workDate)}${assumed ? " (assumed today)" : ""}`],
+    ["Team", sheet.teamNumber ? `Team ${sheet.teamNumber}` : "—"],
   ];
+  if (sheet.location) summary.push(["Location", sheet.location]);
+  summary.push(
+    ["Workers", String(sheet.entries.length)],
+    ["Hours", `${Math.round(hours * 10) / 10} h`],
+    ["Absent", String(absent)],
+  );
+
+  const lines = [card("📋 Timesheet — check it over", summary)];
 
   // the roster itself goes in a <pre> block: Telegram renders it monospaced, so
   // the code/hours columns line up instead of drifting in a proportional font
@@ -2305,7 +2655,7 @@ async function handleCallbackQuery(query: TgCallbackQuery): Promise<void> {
 
   switch (action) {
     case "nskip":
-      return cbSkipDetails(chatId, messageId, session, Number(parts[1]));
+      return cbSkipDetails(chatId, messageId, session, worker, Number(parts[1]));
     case "ts":
       return handleTimesheetCallback(parts[1] ?? "", chatId, messageId, worker, session);
     case "pjm":
@@ -2354,9 +2704,26 @@ async function cbPickProjectForMedia(
     const note = session.draft.pending_note; // saveSession mutates the draft
     const { report } = await createReport(worker.id, projectId, note);
     await saveSession(session, { state: "idle", draft: { report_id: report.id } });
-    const line = `✅ Noted → ${project.code} · ${await fmtDate(report.report_date)}\n“${note.slice(0, 120)}”`;
-    if (messageId) await resolvePrompt(chatId, messageId, line);
-    else await send(chatId, line, { reply_markup: MAIN_KEYBOARD });
+    const receipt = await receiptCard(
+      {
+        jobRef: report.job_ref ?? "—",
+        reportDate: report.report_date,
+        note: report.note,
+        code: project.code,
+        name: project.name,
+        mediaTypes: [],
+      },
+      await recordsToday(worker.id),
+    );
+    const markup = { inline_keyboard: reportButtons(report.id) };
+    if (messageId) {
+      await resolvePrompt(chatId, messageId, receipt, {
+        parse_mode: "HTML",
+        reply_markup: markup,
+      });
+    } else {
+      await send(chatId, receipt, { parse_mode: "HTML", reply_markup: markup });
+    }
     return;
   }
 
@@ -2380,13 +2747,15 @@ async function cbPickProjectForMedia(
   const { report, created } = await createReport(worker.id, projectId, caption, group);
 
   // bounded parallelism: 3 at a time keeps a big album inside the wall clock
-  let stored = 0;
+  const storedTypes: string[] = [];
   for (let i = 0; i < pending.length; i += 3) {
-    const results = await Promise.all(
-      pending.slice(i, i + 3).map((p) => storeMedia(report, p.media)),
-    );
-    stored += results.filter(Boolean).length;
+    const batch = pending.slice(i, i + 3);
+    const results = await Promise.all(batch.map((p) => storeMedia(report, p.media)));
+    results.forEach((ok, n) => {
+      if (ok) storedTypes.push(batch[n].media.media_type);
+    });
   }
+  const stored = storedTypes.length;
   await supabase.from("pending_media").delete().eq("chat_id", chatId);
 
   await saveSession(session, {
@@ -2400,8 +2769,11 @@ async function cbPickProjectForMedia(
     return;
   }
   if (created) {
-    if (report.note !== null) await sendReportConfirmation(chatId, report, project.code);
-    else await askForDetails(chatId, session, report, project.code, stored);
+    if (report.note !== null) {
+      await sendReportConfirmation(chatId, report, project, worker.id, storedTypes);
+    } else {
+      await askForDetails(chatId, session, report, project, worker, storedTypes);
+    }
   }
   if (stored < pending.length) {
     await send(
@@ -2446,18 +2818,24 @@ async function refreshReportCard(
   reportId: number,
 ): Promise<void> {
   if (!messageId) return;
-  const { data, error } = await supabase
-    .from("reports")
-    .select("id, report_date, projects(code)")
-    .eq("id", reportId)
-    .maybeSingle();
-  if (error || !data) return;
+  const c = await loadRecordCard(reportId);
+  if (!c) return;
 
-  const code = (data as { projects?: { code?: string } | null }).projects?.code ?? "site";
+  // the same card as the receipt, minus the daily tally — that line belongs to
+  // the moment the record was filed, not to every later correction
+  const rows: [string, string][] = [
+    ["Ref", c.jobRef],
+    ["Site", siteLine(c)],
+    ["Date", await fmtDateFull(c.reportDate)],
+    ["Description", c.note ? c.note : "—"],
+  ];
+  if (c.mediaTypes.length > 0) rows.push(["Files", mediaLabel(c.mediaTypes)]);
+
   await tg("editMessageText", {
     chat_id: chatId,
     message_id: messageId,
-    text: `✅ Saved → ${code} · ${await fmtDate(data.report_date as string)}`,
+    text: card("✅ Record saved", rows, c.name ? `Saved to the ${c.name} archive.` : undefined),
+    parse_mode: "HTML",
     reply_markup: { inline_keyboard: reportButtons(reportId) },
   });
 }

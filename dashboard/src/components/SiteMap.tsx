@@ -8,6 +8,8 @@ export interface MapPoint {
   kind: "in" | "out" | "site";
   label: string;
   sub?: string;
+  /** Optional numbered badge for multi-project overview maps. */
+  number?: number;
 }
 
 interface Props {
@@ -39,11 +41,12 @@ function escapeHtml(value: string): string {
     .replace(/"/g, "&quot;");
 }
 
-function iconFor(kind: MapPoint["kind"]): L.DivIcon {
-  const size = kind === "site" ? 20 : 18;
+function iconFor(point: MapPoint): L.DivIcon {
+  const overview = point.kind === "site" && point.number !== undefined;
+  const size = overview ? 28 : point.kind === "site" ? 20 : 18;
   return L.divIcon({
-    className: `map-pin map-pin-${kind}`,
-    html: '<span class="map-pin-mark" aria-hidden="true"></span>',
+    className: `map-pin map-pin-${point.kind}${overview ? " map-pin-overview" : ""}`,
+    html: `<span class="map-pin-mark" aria-hidden="true">${overview ? point.number : ""}</span>`,
     iconSize: [size, size],
     iconAnchor: [size / 2, size / 2],
     tooltipAnchor: [0, -size / 2],
@@ -97,7 +100,7 @@ export function SiteMap({ points, connect = false, height = 360, className = "" 
 
     const latlngs = parsed.map((p) => L.latLng(p.lat, p.lng));
     parsed.forEach((p, i) => {
-      L.marker(latlngs[i], { icon: iconFor(p.kind), keyboard: false })
+      L.marker(latlngs[i], { icon: iconFor(p), keyboard: false })
         .addTo(map)
         .bindTooltip(
           `<strong>${escapeHtml(p.label)}</strong>${

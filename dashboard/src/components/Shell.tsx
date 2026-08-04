@@ -8,6 +8,7 @@ import { useFocusTrap } from "../lib/useFocusTrap";
 import { useMediaQuery } from "../lib/useMediaQuery";
 import {
   Bell,
+  CalendarDays,
   ClipboardList,
   FolderOpen,
   LayoutDashboard,
@@ -15,6 +16,7 @@ import {
   MapPin,
   Menu,
   Search,
+  Send,
   Settings,
   Settings2,
   Users,
@@ -106,6 +108,12 @@ export function Shell() {
       ? pageTitle.title
       : routeTitle(location.pathname);
   const name = profile?.full_name ?? "Signed in";
+  const today = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Singapore",
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+  }).format(new Date());
   const groups = useMemo(() => GROUPS.filter((g) => isAdmin || !g.adminOnly), [isAdmin]);
 
   // One aggregate call feeds both sidebar count pills; staff never see the rows.
@@ -148,7 +156,7 @@ export function Shell() {
   return (
     <>
       <div className="orb" aria-hidden="true" />
-      <div className={`app${compact ? " compact" : ""}`}>
+      <div className={`app${compact ? " compact" : ""}${location.pathname === "/" ? " overview-route" : ""}`}>
         {open && (
           <div className="scrim" onMouseDown={() => setDrawer(false)} aria-hidden="true" />
         )}
@@ -164,8 +172,8 @@ export function Shell() {
               CL
             </span>
             <span className="side-brand-text">
-              <span className="side-brand-name truncate">CL Automation</span>
-              <span className="side-brand-sub">Site records</span>
+              <span className="side-brand-name truncate">Site Command</span>
+              <span className="side-brand-sub">CL Automation</span>
             </span>
           </div>
 
@@ -202,6 +210,19 @@ export function Shell() {
           </nav>
 
           <div className="side-spacer" />
+
+          <div className="side-source">
+            <span className="side-source-label">Data source</span>
+            <div>
+              <span className="side-source-icon" aria-hidden="true">
+                <Send size={17} strokeWidth={1.7} />
+              </span>
+              <span>
+                <strong>Telegram</strong>
+                <small>Connected <i aria-hidden="true" /></small>
+              </span>
+            </div>
+          </div>
 
           <div className="side-foot">
             {isAdmin && (
@@ -243,9 +264,11 @@ export function Shell() {
               </button>
             )}
 
-            <h1 className="truncate" title={title}>
-              {title}
-            </h1>
+            <div className="topbar-context">
+              <span className="sync-state"><i aria-hidden="true" /> Live sync</span>
+              <span className="topbar-date"><CalendarDays size={16} strokeWidth={1.7} aria-hidden="true" /> {today}</span>
+            </div>
+            <h1 className="topbar-title truncate" title={title}>{title}</h1>
 
             <form
               className="topbar-search"
