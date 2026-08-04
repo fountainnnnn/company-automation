@@ -1097,7 +1097,11 @@ async function handleGroupMedia(
 
   if (media.media_group_id) {
     report = await findAlbumReport(media.media_group_id);
-  } else {
+  } else if (!caption) {
+    // Uncaptioned singles are a photo burst — continue the sender's current
+    // update. A CAPTIONED single is a NEW status ("pour done, no defects") and
+    // must stand as its own report, even a minute after the last one; crews
+    // post several distinct statuses per site per day.
     report = await findRecentGroupReport(sender.id, link.project_id);
   }
 
@@ -1144,14 +1148,13 @@ async function groupTimesheet(
   const workDate = sheet.workDate ?? await localDate();
   const team = sheet.teamNumber ?? "—";
 
-  const existing = await findExistingTimesheet(workDate, sheet.teamNumber);
+  // Crews re-post the roster as the day evolves (someone left early, a no-show
+  // turned up). The latest list for this site+team+date is the truth — replace
+  // the earlier one instead of refusing the update.
+  const existing = await findExistingTimesheet(workDate, sheet.teamNumber, link.project_id);
   if (existing) {
-    await replyTo(
-      chatId,
-      message.message_id,
-      `Already filed for Team ${team} on ${await fmtDate(workDate)} — DM me to replace it.`,
-    );
-    return;
+    const del = await supabase.from("timesheets").delete().eq("id", existing.id);
+    if (del.error) throw del.error;
   }
 
   const sender = await resolveGroupSender(from);
@@ -1183,7 +1186,9 @@ async function groupTimesheet(
   }
 
   const lines = [
-    `✅ Timesheet saved · ${await fmtDate(workDate)} · Team ${team} · ${rows.length} entries`,
+    existing
+      ? `♻️ Timesheet updated · ${await fmtDate(workDate)} · Team ${team} · ${rows.length} entries (replaces the earlier list)`
+      : `✅ Timesheet saved · ${await fmtDate(workDate)} · Team ${team} · ${rows.length} entries`,
   ];
   if (sheet.unparsed.length > 0) {
     lines.push(`⚠️ Couldn't read: ${sheet.unparsed.join(" | ").slice(0, 300)}`);
@@ -2020,11 +2025,14 @@ function tsTypedLocation(chatId: number, session: Session, text: string): Promis
 async function findExistingTimesheet(
   workDate: string,
   teamNumber: string | null,
+  projectId?: number,
 ): Promise<{ id: number } | null> {
   let query = supabase.from("timesheets").select("id").eq("work_date", workDate);
   query = teamNumber === null
     ? query.is("team_number", null)
     : query.eq("team_number", teamNumber);
+  // group flow scopes to its own site so "Team 1" at two sites never collide
+  if (projectId !== undefined) query = query.eq("project_id", projectId);
   const { data, error } = await query.order("id").limit(1);
   if (error) throw error;
   return (data?.[0] as { id: number }) ?? null;
