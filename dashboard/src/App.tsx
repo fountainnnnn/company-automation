@@ -23,6 +23,9 @@ const SearchPage = lazy(() => import("./pages/Search").then((m) => ({ default: m
 const AttendancePage = lazy(() =>
   import("./pages/Attendance").then((m) => ({ default: m.AttendancePage })),
 );
+const PayrollPage = lazy(() =>
+  import("./pages/Payroll").then((m) => ({ default: m.PayrollPage })),
+);
 const WorkersPage = lazy(() =>
   import("./pages/Workers").then((m) => ({ default: m.WorkersPage })),
 );
@@ -103,6 +106,14 @@ export default function App() {
                 element={
                   <RequireAdmin>
                     <AttendancePage />
+                  </RequireAdmin>
+                }
+              />
+              <Route
+                path="payroll"
+                element={
+                  <RequireAdmin>
+                    <PayrollPage />
                   </RequireAdmin>
                 }
               />

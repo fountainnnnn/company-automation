@@ -20,6 +20,7 @@ import {
   Settings,
   Settings2,
   Users,
+  Wallet,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { SkeletonList } from "./Skeleton";
@@ -57,6 +58,7 @@ const GROUPS: NavGroup[] = [
     items: [
       { to: "/attendance", label: "Attendance", icon: MapPin, end: false, badge: "flags" },
       { to: "/workers", label: "Workers", icon: Users, end: false, badge: "pending" },
+      { to: "/payroll", label: "Payroll", icon: Wallet, end: false },
       { to: "/projects-admin", label: "Manage", icon: Settings2, end: false },
     ],
   },
@@ -70,6 +72,7 @@ const ROUTE_TITLES: Array<[string, string]> = [
   ["/search", "Search"],
   ["/attendance", "Attendance"],
   ["/workers", "Workers"],
+  ["/payroll", "Payroll"],
   ["/settings", "Settings"],
 ];
 

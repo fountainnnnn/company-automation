@@ -12,6 +12,22 @@ import { useToast } from "../components/Toast";
 
 const WORKER_ROLES: TimesheetRole[] = ["worker", "driver", "welder", "supervisor"];
 
+/** PostgREST can hand a numeric back as a string; every pay field is arithmetic. */
+function normalizeWorker(w: Worker): Worker {
+  return {
+    ...w,
+    hourly_rate:
+      w.hourly_rate === null || w.hourly_rate === undefined ? null : Number(w.hourly_rate),
+    expected_hours: Number(w.expected_hours ?? 8),
+    ot_multiplier: Number(w.ot_multiplier ?? 1.5),
+  };
+}
+
+/** Text for a pay input — an unset rate shows blank, never "0". */
+function rateText(rate: number | null): string {
+  return rate === null ? "" : String(rate);
+}
+
 interface AssignState {
   worker: Worker;
   projectIds: string[];
@@ -34,7 +50,7 @@ export function WorkersPage() {
       supabase.from("project_workers").select("project_id,worker_id"),
     ]);
     if (wk.error) toast.error(wk.error.message);
-    setWorkers((wk.data ?? []) as Worker[]);
+    setWorkers(((wk.data ?? []) as Worker[]).map(normalizeWorker));
     setProjects((pj.data ?? []) as Project[]);
     setLinks((pw.data ?? []) as ProjectWorker[]);
   }, [toast]);
@@ -204,6 +220,9 @@ export function WorkersPage() {
                 <th>Worker ID</th>
                 <th>Role</th>
                 <th>Team</th>
+                <th className="num">Rate (S$/h)</th>
+                <th className="num">Expected h/day</th>
+                <th className="num">OT ×</th>
                 <th>Telegram</th>
                 <th>Projects</th>
                 <th>Default</th>
@@ -299,6 +318,117 @@ export function WorkersPage() {
                               next ? `Team set to ${next}.` : "Team cleared.",
                             );
                           }
+                        }}
+                      />
+                    </td>
+                    <td style={{ minWidth: 128 }}>
+                      <label className="sr-only" htmlFor={`wrate-${w.id}`}>
+                        Hourly rate for {w.full_name}
+                      </label>
+                      <div className="pay-cell">
+                        <input
+                          id={`wrate-${w.id}`}
+                          className="input input-sm tnum"
+                          type="number"
+                          step="0.01"
+                          min={0}
+                          inputMode="decimal"
+                          defaultValue={rateText(w.hourly_rate)}
+                          placeholder="not set"
+                          onBlur={(e) => {
+                            const input = e.target;
+                            const raw = input.value.trim();
+                            const parsed = raw === "" ? 0 : Number(raw);
+                            if (!Number.isFinite(parsed) || parsed < 0) {
+                              toast.error("Rate must be zero or more, or blank for not set.");
+                              input.value = rateText(w.hourly_rate);
+                              return;
+                            }
+                            // Blank and 0 both mean "no rate" — storing 0 would pay nothing
+                            // while still counting the worker as priced.
+                            const next = parsed > 0 ? Math.round(parsed * 100) / 100 : null;
+                            if (next === w.hourly_rate) {
+                              input.value = rateText(next);
+                              return;
+                            }
+                            input.value = rateText(next);
+                            void patchWorker(
+                              w.id,
+                              { hourly_rate: next },
+                              next === null ? "Rate cleared." : `Rate set to S$${next.toFixed(2)}/h.`,
+                            );
+                          }}
+                        />
+                        {w.hourly_rate === null && (
+                          <StatusChip
+                            kind="warn"
+                            label="no rate"
+                            title="Without a rate this worker is left out of payroll totals."
+                          />
+                        )}
+                      </div>
+                    </td>
+                    <td style={{ minWidth: 96 }}>
+                      <label className="sr-only" htmlFor={`wexp-${w.id}`}>
+                        Expected hours per day for {w.full_name}
+                      </label>
+                      <input
+                        id={`wexp-${w.id}`}
+                        className="input input-sm tnum"
+                        type="number"
+                        step="0.5"
+                        min={1}
+                        max={24}
+                        inputMode="decimal"
+                        defaultValue={String(w.expected_hours)}
+                        onBlur={(e) => {
+                          const input = e.target;
+                          const next = Number(input.value.trim());
+                          if (!Number.isFinite(next) || next < 1 || next > 24) {
+                            toast.error("Expected hours must be between 1 and 24.");
+                            input.value = String(w.expected_hours);
+                            return;
+                          }
+                          const rounded = Math.round(next * 10) / 10;
+                          input.value = String(rounded);
+                          if (rounded === w.expected_hours) return;
+                          void patchWorker(
+                            w.id,
+                            { expected_hours: rounded },
+                            `Expected hours set to ${rounded}.`,
+                          );
+                        }}
+                      />
+                    </td>
+                    <td style={{ minWidth: 84 }}>
+                      <label className="sr-only" htmlFor={`wot-${w.id}`}>
+                        Overtime multiplier for {w.full_name}
+                      </label>
+                      <input
+                        id={`wot-${w.id}`}
+                        className="input input-sm tnum"
+                        type="number"
+                        step="0.1"
+                        min={1}
+                        max={5}
+                        inputMode="decimal"
+                        defaultValue={String(w.ot_multiplier)}
+                        onBlur={(e) => {
+                          const input = e.target;
+                          const next = Number(input.value.trim());
+                          if (!Number.isFinite(next) || next < 1 || next > 5) {
+                            toast.error("Overtime multiplier must be between 1 and 5.");
+                            input.value = String(w.ot_multiplier);
+                            return;
+                          }
+                          const rounded = Math.round(next * 100) / 100;
+                          input.value = String(rounded);
+                          if (rounded === w.ot_multiplier) return;
+                          void patchWorker(
+                            w.id,
+                            { ot_multiplier: rounded },
+                            `Overtime multiplier set to ×${rounded}.`,
+                          );
                         }}
                       />
                     </td>

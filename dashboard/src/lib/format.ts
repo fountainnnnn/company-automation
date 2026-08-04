@@ -135,6 +135,32 @@ export function formatDistance(meters: number | null): string {
     : `${Math.round(meters)} m apart`;
 }
 
+/**
+ * "S$1,234.50". The symbol is written out rather than left to `style: "currency"`,
+ * which collapses SGD to a bare "$" in the en-SG locale.
+ */
+const amountFmt = new Intl.NumberFormat("en-SG", {
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
+
+const wholeAmountFmt = new Intl.NumberFormat("en-SG", { maximumFractionDigits: 0 });
+
+/** `cents: false` gives "S$1,234" — charts label the magnitude, not the ledger. */
+export function formatMoney(
+  value: number | null | undefined,
+  { cents = true }: { cents?: boolean } = {},
+): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
+  return `S$${(cents ? amountFmt : wholeAmountFmt).format(value)}`;
+}
+
+/** "7.5" — one decimal, or an em dash when there is nothing to show. */
+export function formatHours(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
+  return value.toFixed(1);
+}
+
 export function formatFileSize(bytes: number | null): string {
   if (!bytes) return "";
   if (bytes < 1024) return `${bytes} B`;

@@ -11,7 +11,7 @@ const REPORTS = "var(--series-1)";
 const MEDIA = "var(--series-2)";
 
 /** 3–4 round ticks covering `max`, so the axis reads without decoding. */
-function niceTicks(max: number): number[] {
+export function niceTicks(max: number): number[] {
   if (max <= 0) return [0, 1];
   const raw = max / 3;
   const mag = 10 ** Math.floor(Math.log10(raw));

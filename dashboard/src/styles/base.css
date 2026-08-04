@@ -1561,6 +1561,77 @@ table.data td.nowrap {
   font-weight: 600;
 }
 
+/* ---------- payroll ---------- */
+a.chip {
+  text-decoration: none;
+}
+a.chip:hover {
+  filter: brightness(0.97);
+}
+a.chip:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+/* Sortable header: a real button that keeps the header's uppercase label. */
+.sort-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  background: none;
+  border: 0;
+  font: inherit;
+  color: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  cursor: pointer;
+}
+.sort-btn:hover {
+  color: var(--blue);
+}
+.sort-btn:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+.sort-glyph {
+  font-size: 0.7rem;
+  line-height: 1;
+  color: var(--gray-light);
+}
+.sort-glyph.active {
+  color: var(--blue);
+}
+.sort-glyph.active.asc {
+  transform: rotate(180deg);
+}
+.pay-row {
+  cursor: pointer;
+}
+.pay-table td.pay-gross {
+  color: var(--ink);
+  font-weight: 600;
+}
+.pay-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+/* Rate input and its "no rate" warning stay on one line at the table's row height. */
+.pay-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.pay-cell .input-sm {
+  width: 84px;
+}
+.pay-policy {
+  margin-top: var(--s-3);
+  font-size: 0.82rem;
+}
+
 /* ---------- layout helpers ---------- */
 .stack {
   display: flex;
@@ -1868,6 +1939,23 @@ table.data td.nowrap {
   stroke: var(--hairline-strong);
   stroke-width: 1;
 }
+/* stacked columns: the hovered day's band, and the one-shot rise */
+.col-band {
+  fill: var(--blue-tint);
+}
+.col-rise {
+  transform-box: fill-box;
+  transform-origin: bottom;
+  animation: rise var(--t-draw) var(--ease) both;
+}
+@keyframes rise {
+  from {
+    transform: scaleY(0);
+  }
+  to {
+    transform: scaleY(1);
+  }
+}
 .marker {
   stroke: #fff;
   stroke-width: 2;
@@ -1976,6 +2064,33 @@ table.data td.nowrap {
   color: var(--ink);
   font-size: 0.82rem;
   font-weight: 600;
+}
+
+/* rows carrying a sub-line: same three columns, plus a full-width second line */
+.bar-list.has-subs {
+  gap: 14px;
+}
+.has-subs .bar-row {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr) 86px;
+  align-items: center;
+  column-gap: var(--s-3);
+  row-gap: 3px;
+}
+.has-subs .bar-label,
+.has-subs .bar-value {
+  width: auto;
+}
+.bar-sub-line {
+  grid-column: 1 / -1;
+  color: var(--ink-2);
+  font-size: 0.76rem;
+}
+@media (max-width: 420px) {
+  .has-subs .bar-row {
+    grid-template-columns: 76px minmax(0, 1fr) 74px;
+    column-gap: var(--s-2);
+  }
 }
 
 /* media mix */

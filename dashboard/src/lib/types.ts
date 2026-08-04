@@ -34,6 +34,12 @@ export interface Worker {
   worker_code: string | null;
   role: TimesheetRole;
   team_number: string | null;
+  /** Pay rate in S$/hour. Null means "not set" — the worker is left out of pay totals. */
+  hourly_rate: number | null;
+  /** Hours per day before overtime starts. */
+  expected_hours: number;
+  /** Multiplier applied to the hourly rate beyond the expected hours. */
+  ot_multiplier: number;
 }
 
 export interface ProjectWorker {
@@ -142,6 +148,32 @@ export interface WorkerHoursRow {
   shifts: number;
 }
 
+/** One crew from `hours_by_team(days)` — supervisor-filed timesheets, so it covers everyone. */
+export interface TeamHoursRow {
+  team_number: string;
+  hours: number;
+  entries: number;
+  absences: number;
+  workers: number;
+}
+
+/** One site from `cost_by_project(days)` — built on attendance, so staff read nothing. */
+export interface ProjectCostRow {
+  project_id: string | number;
+  code: string;
+  name: string;
+  hours: number;
+  ot_hours: number;
+  gross_pay: number;
+}
+
+/** One zero-filled day from `ot_by_day(days)` — admin only, same reason. */
+export interface OtDayRow {
+  day: string;
+  normal_hours: number;
+  ot_hours: number;
+}
+
 /** One slice from `media_mix(days)`. */
 export interface MediaMixRow {
   media_type: MediaType;
@@ -216,6 +248,53 @@ export const EMPTY_TIMESHEET_FILTERS: TimesheetFilters = {
   worker: "",
   location: "",
 };
+
+/**
+ * One worker's pay for a period, from the `payroll_summary(from, to)` RPC.
+ * `hourly_rate` null means no rate is set, so `gross_pay` cannot be trusted as money.
+ */
+export interface PayrollRow {
+  worker_id: number;
+  worker_code: string | null;
+  worker_name: string;
+  role: TimesheetRole;
+  hourly_rate: number | null;
+  expected_hours: number;
+  ot_multiplier: number;
+  days_worked: number;
+  paid_hours: number;
+  normal_hours: number;
+  ot_hours: number;
+  gross_pay: number;
+  /** Shifts in the period with no check-out — they earn nothing until resolved. */
+  missing_checkout: number;
+  flagged: number;
+}
+
+/** One shift priced by the `attendance_pay` view. Pay runs from `paid_from`, not check-in. */
+export interface AttendancePayRow {
+  attendance_id: number;
+  worker_id: number;
+  worker_name: string | null;
+  worker_code: string | null;
+  role: TimesheetRole;
+  project_id: number | null;
+  project_code: string | null;
+  work_date: string;
+  check_in_at: string;
+  check_out_at: string | null;
+  flags: string[] | null;
+  review_status: ReviewStatus;
+  hourly_rate: number | null;
+  expected_hours: number;
+  ot_multiplier: number;
+  /** The fixed 08:00 start pay is measured from, as a timestamp on the check-in's day. */
+  paid_from: string | null;
+  paid_hours: number | null;
+  normal_hours: number | null;
+  ot_hours: number | null;
+  gross_pay: number | null;
+}
 
 export interface Filters {
   from: string;

@@ -16,11 +16,28 @@ import { SiteMap, type MapPoint } from "../components/SiteMap";
 import { Skeleton } from "../components/Skeleton";
 import { Sparkline } from "../components/Sparkline";
 import { useToast } from "../components/Toast";
+import { RankedBars, type BarItem } from "../components/charts/RankedBars";
+import { StackedHoursChart } from "../components/charts/StackedHoursChart";
 import { useAuth } from "../lib/auth";
-import { formatDayShort, formatRelative, formatTime, toSgtDay } from "../lib/format";
+import {
+  formatDayShort,
+  formatHours,
+  formatMoney,
+  formatRelative,
+  formatTime,
+  toSgtDay,
+} from "../lib/format";
 import { REPORT_SELECT, signReportMedia } from "../lib/reports";
 import { supabase } from "../lib/supabase";
-import type { DayVolumeRow, OverviewStats, Project, Report } from "../lib/types";
+import type {
+  DayVolumeRow,
+  OtDayRow,
+  OverviewStats,
+  Project,
+  ProjectCostRow,
+  Report,
+  TeamHoursRow,
+} from "../lib/types";
 
 const RANGES = [7, 30, 90];
 const FALLBACK_IMAGES = [
@@ -48,6 +65,10 @@ interface OverviewData {
   projects: Project[];
   reports: Report[];
   signedUrls: Record<string, string>;
+  teams: TeamHoursRow[];
+  costs: ProjectCostRow[];
+  otDays: OtDayRow[];
+  range: number;
 }
 
 interface SiteCard {
@@ -85,7 +106,15 @@ export function OverviewPage() {
     setData(null);
 
     void (async () => {
-      const [statsResult, daysResult, projectsResult, reportsResult] = await Promise.all([
+      const [
+        statsResult,
+        daysResult,
+        projectsResult,
+        reportsResult,
+        teamsResult,
+        costResult,
+        otResult,
+      ] = await Promise.all([
         supabase.rpc("overview_stats"),
         supabase.rpc("reports_by_day", { days: range }),
         supabase
@@ -98,12 +127,23 @@ export function OverviewPage() {
           .select(REPORT_SELECT)
           .order("created_at", { ascending: false })
           .limit(24),
+        supabase.rpc("hours_by_team", { days: range }),
+        // The two pay RPCs read attendance, which RLS closes to staff — they come
+        // back empty there and their sections are simply not rendered.
+        supabase.rpc("cost_by_project", { days: range }),
+        supabase.rpc("ot_by_day", { days: range }),
       ]);
 
       if (!active) return;
-      const failed = [statsResult, daysResult, projectsResult, reportsResult].find(
-        (result) => result.error,
-      );
+      const failed = [
+        statsResult,
+        daysResult,
+        projectsResult,
+        reportsResult,
+        teamsResult,
+        costResult,
+        otResult,
+      ].find((result) => result.error);
       if (failed?.error) toast.error(failed.error.message);
 
       const reports = (reportsResult.data ?? []) as unknown as Report[];
@@ -120,6 +160,25 @@ export function OverviewPage() {
         projects: (projectsResult.data ?? []) as unknown as Project[],
         reports,
         signedUrls,
+        teams: ((teamsResult.data ?? []) as TeamHoursRow[]).map((team) => ({
+          ...team,
+          hours: Number(team.hours),
+          entries: Number(team.entries),
+          absences: Number(team.absences),
+          workers: Number(team.workers),
+        })),
+        costs: ((costResult.data ?? []) as ProjectCostRow[]).map((row) => ({
+          ...row,
+          hours: Number(row.hours),
+          ot_hours: Number(row.ot_hours),
+          gross_pay: Number(row.gross_pay),
+        })),
+        otDays: ((otResult.data ?? []) as OtDayRow[]).map((row) => ({
+          ...row,
+          normal_hours: Number(row.normal_hours),
+          ot_hours: Number(row.ot_hours),
+        })),
+        range,
       });
     })();
 
@@ -155,12 +214,16 @@ export function OverviewPage() {
         </div>
       </div>
 
-      {data === null ? <CommandSkeleton /> : <CommandBoard data={data} isAdmin={isAdmin} />}
+      {data === null ? (
+        <CommandSkeleton isAdmin={isAdmin} />
+      ) : (
+        <CommandBoard data={data} isAdmin={isAdmin} />
+      )}
     </div>
   );
 }
 
-function CommandSkeleton() {
+function CommandSkeleton({ isAdmin }: { isAdmin: boolean }) {
   return (
     <div className="command-board" aria-busy="true" aria-label="Loading operations overview">
       <div className="command-map glass-panel"><Skeleton height={330} radius={14} /></div>
@@ -168,6 +231,17 @@ function CommandSkeleton() {
       <div className="command-metrics glass-panel"><Skeleton height={72} radius={12} /></div>
       <div className="command-sites glass-panel"><Skeleton height={260} radius={12} /></div>
       <div className="command-activity glass-panel"><Skeleton height={260} radius={12} /></div>
+      <div className="command-charts">
+        <div className="command-chart glass-panel"><Skeleton height={210} radius={12} /></div>
+        {isAdmin && (
+          <div className="command-chart glass-panel"><Skeleton height={210} radius={12} /></div>
+        )}
+      </div>
+      {isAdmin && (
+        <div className="command-chart command-ot glass-panel">
+          <Skeleton height={250} radius={12} />
+        </div>
+      )}
     </div>
   );
 }
@@ -223,6 +297,33 @@ function CommandBoard({ data, isAdmin }: { data: OverviewData; isAdmin: boolean 
       })
       .slice(0, 3);
   }, [data.projects, data.reports, data.signedUrls]);
+
+  const teamBars = useMemo<BarItem[]>(
+    () =>
+      data.teams.map((team) => {
+        const name = team.team_number === "—" ? "Unassigned" : `Team ${team.team_number}`;
+        return {
+          key: team.team_number,
+          label: name,
+          title: name,
+          value: team.hours,
+          sub: `${plural(team.workers, "worker")} · ${plural(team.absences, "absence")}`,
+        };
+      }),
+    [data.teams],
+  );
+
+  const costBars = useMemo<BarItem[]>(
+    () =>
+      data.costs.map((row) => ({
+        key: String(row.project_id),
+        label: row.code,
+        title: `${row.code} · ${row.name}`,
+        value: row.gross_pay,
+        sub: `${formatHours(row.hours)}h · ${formatHours(row.ot_hours)}h OT`,
+      })),
+    [data.costs],
+  );
 
   const trend = data.days.slice(-12).map((day) => day.reports);
   const mediaTrend = data.days.slice(-12).map((day) => day.media);
@@ -309,8 +410,81 @@ function CommandBoard({ data, isAdmin }: { data: OverviewData; isAdmin: boolean 
           </ol>
         )}
       </section>
+
+      <div className="command-charts">
+        <ChartPanel
+          id="team-hours-title"
+          title="Team performance"
+          subtitle={`Hours logged, last ${data.range} days`}
+        >
+          <RankedBars
+            items={teamBars}
+            label="Hours logged per team"
+            format={(v) => `${formatHours(v)}h`}
+            emptyTitle="No timesheets in this window"
+            emptyHint="Crew hours appear once a supervisor files the daily roster."
+          />
+        </ChartPanel>
+
+        {isAdmin && (
+          <ChartPanel
+            id="site-cost-title"
+            title="Labour cost by site"
+            subtitle={`Gross pay, last ${data.range} days`}
+          >
+            <RankedBars
+              items={costBars}
+              label="Gross pay per site"
+              format={(v) => formatMoney(v, { cents: false })}
+              emptyTitle="No priced shifts in this window"
+              emptyHint="Pay is counted once a shift is checked out and the worker has a rate."
+            />
+          </ChartPanel>
+        )}
+      </div>
+
+      {isAdmin && (
+        <ChartPanel
+          id="ot-trend-title"
+          className="command-ot"
+          title="Overtime trend"
+          subtitle="Overtime is every hour past a worker's expected day"
+        >
+          <StackedHoursChart data={data.otDays} />
+        </ChartPanel>
+      )}
     </div>
   );
+}
+
+function ChartPanel({
+  id,
+  title,
+  subtitle,
+  className = "",
+  children,
+}: {
+  id: string;
+  title: string;
+  subtitle: string;
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <section className={`command-chart glass-panel ${className}`.trim()} aria-labelledby={id}>
+      <div className="command-panel-head">
+        <div className="command-panel-title">
+          <h3 id={id}>{title}</h3>
+          <p>{subtitle}</p>
+        </div>
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function plural(count: number, one: string): string {
+  return `${count} ${count === 1 ? one : `${one}s`}`;
 }
 
 function ReviewQueue({ stats, isAdmin }: { stats: OverviewStats; isAdmin: boolean }) {

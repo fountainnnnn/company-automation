@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useState } from "react";
 import type { RefObject } from "react";
 
 /**
@@ -7,6 +7,13 @@ import type { RefObject } from "react";
  */
 export function useElementWidth(ref: RefObject<HTMLElement | null>, fallback = 640): number {
   const [width, setWidth] = useState(fallback);
+
+  // Measure before paint: the observer only reports on the next frame, so a
+  // chart would otherwise draw one frame at the fallback width.
+  useLayoutEffect(() => {
+    const w = ref.current?.getBoundingClientRect().width ?? 0;
+    if (w > 0) setWidth(Math.round(w));
+  }, [ref]);
 
   useEffect(() => {
     const node = ref.current;

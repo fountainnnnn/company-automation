@@ -7,29 +7,65 @@ import { Skeleton } from "../components/Skeleton";
 import { useToast } from "../components/Toast";
 
 const KEY = "flag_distance_km";
+const DAY_START_KEY = "payroll_day_start";
+
+/** "8:5" and "08:05" both come out as "08:05"; anything else is rejected. */
+function normalizeTime(raw: string): string | null {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(raw.trim());
+  if (!m) return null;
+  const h = Number(m[1]);
+  const min = Number(m[2]);
+  if (h > 23 || min > 59) return null;
+  return `${String(h).padStart(2, "0")}:${String(min).padStart(2, "0")}`;
+}
 
 export function SettingsPage() {
   const toast = useToast();
   const [value, setValue] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [dayStart, setDayStart] = useState<string | null>(null);
+  const [dayBusy, setDayBusy] = useState(false);
 
   useEffect(() => {
     let active = true;
     void (async () => {
       const { data, error } = await supabase
         .from("settings")
-        .select("value")
-        .eq("key", KEY)
-        .maybeSingle();
+        .select("key,value")
+        .in("key", [KEY, DAY_START_KEY]);
       if (!active) return;
       if (error) toast.error(error.message);
-      const raw = data?.value;
-      setValue(typeof raw === "number" ? String(raw) : raw ? String(raw) : "10");
+      const byKey = new Map(
+        ((data ?? []) as Array<{ key: string; value: unknown }>).map((r) => [r.key, r.value]),
+      );
+      const km = byKey.get(KEY);
+      setValue(typeof km === "number" ? String(km) : km ? String(km) : "10");
+      const start = byKey.get(DAY_START_KEY);
+      setDayStart(normalizeTime(typeof start === "string" ? start : "") ?? "08:00");
     })();
     return () => {
       active = false;
     };
   }, [toast]);
+
+  async function saveDayStart() {
+    const time = normalizeTime(dayStart ?? "");
+    if (!time) {
+      toast.error("Enter a time of day, like 08:00.");
+      return;
+    }
+    setDayBusy(true);
+    const { error } = await supabase
+      .from("settings")
+      .upsert({ key: DAY_START_KEY, value: time }, { onConflict: "key" });
+    setDayBusy(false);
+    if (error) {
+      toast.error(error.message);
+      return;
+    }
+    setDayStart(time);
+    toast.success(`Payroll day starts at ${time}.`);
+  }
 
   async function save() {
     const km = Number(value);
@@ -92,6 +128,39 @@ export function SettingsPage() {
             onClick={() => void save()}
           >
             Save threshold
+          </Button>
+        </div>
+      </Card>
+
+      <Card style={{ maxWidth: 520, marginTop: 20 }}>
+        <div className="field">
+          <label htmlFor="pay-day-start">Payroll day start</label>
+          {dayStart === null ? (
+            <Skeleton height={40} radius={12} />
+          ) : (
+            <input
+              id="pay-day-start"
+              className="input tnum"
+              type="time"
+              value={dayStart}
+              onChange={(e) => setDayStart(e.target.value)}
+            />
+          )}
+        </div>
+
+        <p className="muted" style={{ marginTop: 12, fontSize: "0.88rem" }}>
+          Pay is calculated from this time to check-out, whatever time the worker actually
+          checked in.
+        </p>
+
+        <div className="modal-actions">
+          <Button
+            variant="primary"
+            loading={dayBusy}
+            disabled={dayStart === null}
+            onClick={() => void saveDayStart()}
+          >
+            Save day start
           </Button>
         </div>
       </Card>

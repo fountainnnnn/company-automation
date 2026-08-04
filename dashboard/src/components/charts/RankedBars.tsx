@@ -3,6 +3,8 @@ export interface BarItem {
   label: string;
   title: string;
   value: number;
+  /** Muted second line under the row — context the magnitude alone cannot carry. */
+  sub?: string;
 }
 
 interface Props {
@@ -56,8 +58,12 @@ export function RankedBars({
   const named = rows.filter((r) => r.key !== "__other");
   const max = Math.max(...named.map((r) => r.value), 1);
 
+  // One row carrying a sub-line switches every row to the two-line grid, so the
+  // bars and values stay on the same columns down the list.
+  const subs = rows.some((r) => r.sub);
+
   return (
-    <ul className="bar-list" aria-label={label}>
+    <ul className={`bar-list${subs ? " has-subs" : ""}`} aria-label={label}>
       {rows.map((r) => {
         const other = r.key === "__other";
         return (
@@ -72,7 +78,12 @@ export function RankedBars({
                 style={{ width: `${Math.min(100, (r.value / max) * 100)}%` }}
               />
             </span>
-            <span className="bar-value tnum">{format(r.value)}</span>
+            <span className="bar-value tnum truncate">{format(r.value)}</span>
+            {r.sub && (
+              <span className="bar-sub-line truncate" title={r.sub}>
+                {r.sub}
+              </span>
+            )}
           </li>
         );
       })}
