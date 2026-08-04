@@ -2211,9 +2211,20 @@ async function saveNoteFromText(
     return;
   }
 
+  // "Add note" must ADD. Overwriting silently destroyed what the worker typed
+  // earlier — the one thing a record keeper must never do. Existing text is
+  // kept and the new line appended; corrections happen in the dashboard.
+  const existing = await ownedReport(reportId, worker.id);
+  if (!existing) {
+    await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
+    await send(chatId, NOT_YOURS);
+    return;
+  }
+  const note = existing.note && existing.note.trim() ? `${existing.note}\n${text}` : text;
+
   const { error } = await supabase
     .from("reports")
-    .update({ note: text })
+    .update({ note })
     .eq("id", reportId)
     .eq("worker_id", worker.id);
   if (error) throw error;
@@ -2661,7 +2672,7 @@ async function handleCallbackQuery(query: TgCallbackQuery): Promise<void> {
     case "pjm":
       return cbPickProjectForMedia(chatId, messageId, worker, session, Number(parts[1]));
     case "rn":
-      return cbAskNote(chatId, session, Number(parts[1]));
+      return cbAskNote(chatId, worker, session, Number(parts[1]));
     case "rd":
       return cbShowDateOptions(chatId, messageId, Number(parts[1]));
     case "rdd":
@@ -2783,12 +2794,26 @@ async function cbPickProjectForMedia(
   }
 }
 
-async function cbAskNote(chatId: number, session: Session, reportId: number): Promise<void> {
+async function cbAskNote(
+  chatId: number,
+  worker: Worker,
+  session: Session,
+  reportId: number,
+): Promise<void> {
   await saveSession(session, {
     state: "adding_note",
     draft: { ...session.draft, report_id: reportId },
   });
-  await send(chatId, "Send the note for this report.");
+  // Say plainly whether this adds to something, so nobody expects a replace.
+  const existing = await ownedReport(reportId, worker.id);
+  const prior = existing?.note?.trim();
+  await send(
+    chatId,
+    prior
+      ? `📝 Send the extra detail — it gets added under:\n<i>${esc(oneLine(prior, 90))}</i>`
+      : "📝 Send the description for this record.",
+    prior ? { parse_mode: "HTML" } : {},
+  );
 }
 
 async function cbShowDateOptions(
