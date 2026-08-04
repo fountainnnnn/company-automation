@@ -5,8 +5,51 @@
 // the isolate. Always answers 200 for authenticated updates so Telegram never
 // enters a retry storm because of an internal failure.
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { looksLikeTimesheet, type ParsedTimesheet, parseTimesheet } from "./parser.ts";
+
+/**
+ * Per-request send queue. A round trip to api.telegram.org costs ~900ms from
+ * this runtime, but Telegram will execute ONE method passed back as the
+ * webhook's own HTTP response — free and instant. So sends are queued during
+ * handling; at the end the last one rides the response and the rest (rare)
+ * go out via the API first, preserving order. Request-scoped via
+ * AsyncLocalStorage so concurrent updates in one isolate can never cross wires.
+ */
+interface ReqCtx {
+  queue: { method: string; payload: Record<string, unknown> }[];
+  bg: Promise<unknown>[];
+}
+const reqCtx = new AsyncLocalStorage<ReqCtx>();
+
+// ---- latency tracing (surfaced only on x-debug requests) -------------------
+const trace = { db: 0, dbn: 0, tg: 0, tgn: 0, other: 0, othern: 0 };
+function traceReset() {
+  trace.db = trace.dbn = trace.tg = trace.tgn = trace.other = trace.othern = 0;
+}
+{
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const t0 = performance.now();
+    try {
+      return await realFetch(input, init);
+    } finally {
+      const dt = performance.now() - t0;
+      if (url.includes("supabase.co")) {
+        trace.db += dt;
+        trace.dbn++;
+      } else if (url.includes("telegram.org")) {
+        trace.tg += dt;
+        trace.tgn++;
+      } else {
+        trace.other += dt;
+        trace.othern++;
+      }
+    }
+  };
+}
 
 const supabase = createClient(
   Deno.env.get("SUPABASE_URL")!,
@@ -281,11 +324,26 @@ async function tg(method: string, payload: Record<string, unknown>): Promise<TgR
 }
 
 function send(chatId: number, text: string, extra: Record<string, unknown> = {}) {
-  return tg("sendMessage", { chat_id: chatId, text, ...extra });
+  const payload = { chat_id: chatId, text, ...extra };
+  const ctx = reqCtx.getStore();
+  if (ctx) {
+    ctx.queue.push({ method: "sendMessage", payload });
+    return Promise.resolve(null);
+  }
+  return tg("sendMessage", payload);
 }
 
 function answerCallback(id: string, text?: string) {
-  return tg("answerCallbackQuery", text ? { callback_query_id: id, text } : { callback_query_id: id });
+  const payload = text ? { callback_query_id: id, text } : { callback_query_id: id };
+  const ctx = reqCtx.getStore();
+  if (ctx) {
+    // fire now, in parallel with the handler — the spinner stops sooner and
+    // the round trip overlaps the DB work instead of preceding it
+    const p = tg("answerCallbackQuery", payload);
+    ctx.bg.push(p);
+    return Promise.resolve(null);
+  }
+  return tg("answerCallbackQuery", payload);
 }
 
 function editKeyboard(chatId: number, messageId: number, rows: InlineButton[][]) {
@@ -316,11 +374,19 @@ function resolvePrompt(chatId: number, messageId: number, text: string) {
  * their message. `tg` already swallows failures — a missing reaction is silent.
  */
 function react(chatId: number, messageId: number, emoji: string) {
-  return tg("setMessageReaction", {
+  const payload = {
     chat_id: chatId,
     message_id: messageId,
     reaction: [{ type: "emoji", emoji }],
-  });
+  };
+  const ctx = reqCtx.getStore();
+  if (ctx) {
+    // acknowledgement, not conversation — overlap it with the handler
+    const p = tg("setMessageReaction", payload);
+    ctx.bg.push(p);
+    return Promise.resolve(null);
+  }
+  return tg("setMessageReaction", payload);
 }
 
 /** Reply threaded to a specific message — for groups, where context is shared. */
@@ -658,17 +724,43 @@ Deno.serve(async (req) => {
     return jsonResponse({ ok: true });
   }
 
+  const debug = req.headers.get("x-debug") === "1";
+  if (debug) traceReset();
+  const t0 = performance.now();
+
+  const ctx: ReqCtx = { queue: [], bg: [] };
+  let failed: unknown = null;
   try {
-    await handleUpdate(update);
+    await reqCtx.run(ctx, () => handleUpdate(update));
   } catch (err) {
+    failed = err;
     console.error("update handling failed", err);
-    // secret header already validated above — safe to echo diagnostics to the tester
-    if (req.headers.get("x-debug") === "1") {
-      const e = err as { message?: string; code?: string };
-      return jsonResponse({ ok: false, error: String(e?.message ?? err), code: e?.code ?? null });
-    }
   }
 
+  // Flush queued sends: everything except the last goes out via the API (in
+  // order); the last rides the webhook response itself, which Telegram
+  // executes on receipt — the user's reply costs zero extra round trips.
+  const last = ctx.queue.length > 0 && !debug ? ctx.queue[ctx.queue.length - 1] : null;
+  const viaApi = last ? ctx.queue.slice(0, -1) : ctx.queue;
+  for (const q of viaApi) await tg(q.method, q.payload);
+  await Promise.all(ctx.bg);
+
+  if (debug) {
+    if (failed) {
+      const e = failed as { message?: string; code?: string };
+      return jsonResponse({ ok: false, error: String(e?.message ?? failed), code: e?.code ?? null });
+    }
+    return jsonResponse({
+      ok: true,
+      ms: Math.round(performance.now() - t0),
+      db_ms: Math.round(trace.db),
+      db_calls: trace.dbn,
+      tg_ms: Math.round(trace.tg),
+      tg_calls: trace.tgn,
+      other_ms: Math.round(trace.other),
+    });
+  }
+  if (last) return jsonResponse({ method: last.method, ...last.payload });
   return jsonResponse({ ok: true });
 });
 
@@ -696,8 +788,8 @@ async function handleMessage(message: TgMessage): Promise<void> {
   if (message.chat.type && message.chat.type !== "private") return;
 
   const chatId = message.chat.id;
-  const session = await getSession(chatId);
-  const worker = await findWorker(from.id);
+  // independent lookups — one round trip to the DB instead of two in series
+  const [session, worker] = await Promise.all([getSession(chatId), findWorker(from.id)]);
 
   if (!worker) return handleUnregistered(chatId, session, message, from);
 
@@ -2190,8 +2282,7 @@ async function handleCallbackQuery(query: TgCallbackQuery): Promise<void> {
     return;
   }
 
-  const session = await getSession(chatId);
-  const worker = await findWorker(query.from.id);
+  const [session, worker] = await Promise.all([getSession(chatId), findWorker(query.from.id)]);
 
   if (!worker || worker.status !== "active") {
     await answerCallback(query.id, worker ? "Your account isn't active." : "Please register first.");
