@@ -20,6 +20,8 @@ import { looksLikeTimesheet, type ParsedTimesheet, parseTimesheet } from "./pars
 interface ReqCtx {
   queue: { method: string; payload: Record<string, unknown> }[];
   bg: Promise<unknown>[];
+  /** Session writes are chained, never raced — see saveSessionSoon. */
+  sessionWrite: Promise<unknown>;
 }
 const reqCtx = new AsyncLocalStorage<ReqCtx>();
 
@@ -162,9 +164,24 @@ interface Report {
   project_id: number;
   worker_id: number;
   report_date: string;
+  /** Newline-joined mirror of report_notes, maintained by a database trigger. */
   note: string | null;
   /** Human-facing record id, `CL-YYYYMMDD-NNN`, assigned by a database trigger. */
   job_ref: string;
+  /** `open` while the worker is still adding to it; `final` once they're done. */
+  status: "open" | "final";
+  /** Only present on the row bot_context hands back (full row as jsonb). */
+  created_at?: string;
+  updated_at?: string;
+}
+
+/** Columns every report read asks for. */
+const REPORT_COLS = "id, project_id, worker_id, report_date, note, job_ref, status";
+
+/** One timestamped line of a record's description. Never concatenated. */
+interface ReportNote {
+  body: string;
+  created_at: string;
 }
 
 interface Attendance {
@@ -193,6 +210,8 @@ interface MediaDescriptor {
 interface Draft {
   project_id?: number;
   report_id?: number;
+  /** The open record's card, so every addition edits it instead of stacking a new one. */
+  card_message_id?: number;
   pending_group?: string | null;
   /** Text-only record waiting for its site pick. */
   pending_note?: string;
@@ -203,7 +222,6 @@ interface Draft {
 
 type SessionState =
   | "idle"
-  | "registering"
   | "awaiting_checkin_location"
   | "awaiting_checkout_location"
   | "choosing_project_for_media"
@@ -287,11 +305,21 @@ async function getSettings(): Promise<Settings> {
     if (settingsCache) return settingsCache.value;
     throw res.error;
   }
-  const map = new Map<string, unknown>(
+  const map = Object.fromEntries(
     (res.data ?? []).map((r) => [r.key as string, r.value]),
   );
-  const tz = map.get("timezone");
-  const km = map.get("flag_distance_km");
+  return cacheSettings(map)!;
+}
+
+/**
+ * Fill the settings cache from a `{key: value}` blob — the shape both the
+ * settings table and bot_context hand back. Returns null when there is nothing
+ * to cache, so the hot path can fall through to a real read.
+ */
+function cacheSettings(map: Record<string, unknown> | null | undefined): Settings | null {
+  if (!map) return null;
+  const tz = map["timezone"];
+  const km = map["flag_distance_km"];
   const value: Settings = {
     timezone: typeof tz === "string" && tz ? tz : "Asia/Singapore",
     flagDistanceKm: typeof km === "number" && km > 0 ? km : 10,
@@ -333,6 +361,37 @@ function send(chatId: number, text: string, extra: Record<string, unknown> = {})
     return Promise.resolve(null);
   }
   return tg("sendMessage", payload);
+}
+
+/**
+ * Rewrite a message in place. Queued like `send`, so the last one rides the
+ * webhook response for free. Use `tg("editMessageText", …)` directly instead
+ * when the caller has to know whether Telegram accepted the edit.
+ */
+function edit(
+  chatId: number,
+  messageId: number,
+  text: string,
+  extra: Record<string, unknown> = {},
+) {
+  const payload = { chat_id: chatId, message_id: messageId, text, ...extra };
+  const ctx = reqCtx.getStore();
+  if (ctx) {
+    ctx.queue.push({ method: "editMessageText", payload });
+    return Promise.resolve(null);
+  }
+  return tg("editMessageText", payload);
+}
+
+/**
+ * Work that the reply doesn't depend on. Still awaited before the response is
+ * returned — this overlaps it with the reply instead of blocking on it — but a
+ * failure can never take the update down with it.
+ */
+function background(work: Promise<unknown>): void {
+  const guarded = work.catch((err) => console.error("background task failed", err));
+  const ctx = reqCtx.getStore();
+  if (ctx) ctx.bg.push(guarded);
 }
 
 function answerCallback(id: string, text?: string) {
@@ -524,19 +583,18 @@ function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number)
 /** A non-idle state left alone this long is stale — revert to idle, keep the sticky project. */
 const SESSION_STALE_MS = 30 * 60_000;
 
-async function getSession(chatId: number): Promise<Session> {
-  const { data, error } = await supabase
-    .from("chat_sessions")
-    .select("chat_id, worker_id, state, draft, updated_at")
-    .eq("chat_id", chatId)
-    .maybeSingle();
+/** A chat_sessions row (or nothing) as the in-memory session. */
+function sessionFromRow(
+  chatId: number,
+  row: { worker_id?: number | null; state?: string | null; draft?: Draft | null; updated_at?: string }
+    | null
+    | undefined,
+): Session {
+  if (!row) return { chat_id: chatId, worker_id: null, state: "idle", draft: {} };
 
-  if (error) throw error;
-  if (!data) return { chat_id: chatId, worker_id: null, state: "idle", draft: {} };
-
-  let state = (data.state ?? "idle") as SessionState;
-  let draft = (data.draft ?? {}) as Draft;
-  const age = Date.now() - new Date(data.updated_at).getTime();
+  let state = (row.state ?? "idle") as SessionState;
+  let draft = (row.draft ?? {}) as Draft;
+  const age = Date.now() - new Date(row.updated_at ?? 0).getTime();
   if (state !== "idle" && age > SESSION_STALE_MS) {
     state = "idle";
     draft = resetDraft(draft);
@@ -544,35 +602,49 @@ async function getSession(chatId: number): Promise<Session> {
 
   return {
     chat_id: chatId,
-    worker_id: data.worker_id ?? null,
+    worker_id: row.worker_id ?? null,
     state,
     draft,
   };
 }
 
-async function saveSession(session: Session, patch: Partial<Session>): Promise<Session> {
-  const next: Session = {
+/**
+ * Apply the patch in memory and persist it alongside the reply rather than
+ * before it. The caller's object is mutated synchronously, so anything later in
+ * the same update reads the new value; the write itself is chained behind any
+ * earlier one (two upserts on one row must not race) and awaited before the
+ * response goes back, so the next update always sees it.
+ */
+function saveSessionSoon(session: Session, patch: Partial<Session>): void {
+  if (patch.worker_id !== undefined) session.worker_id = patch.worker_id;
+  if (patch.state !== undefined) session.state = patch.state;
+  if (patch.draft !== undefined) session.draft = patch.draft;
+
+  const row = {
     chat_id: session.chat_id,
-    worker_id: patch.worker_id !== undefined ? patch.worker_id : session.worker_id,
-    state: patch.state ?? session.state,
-    draft: patch.draft ?? session.draft,
+    worker_id: session.worker_id,
+    state: session.state,
+    draft: session.draft,
+    updated_at: new Date().toISOString(),
   };
-  const { error } = await supabase.from("chat_sessions").upsert(
-    {
-      chat_id: next.chat_id,
-      worker_id: next.worker_id,
-      state: next.state,
-      draft: next.draft,
-      updated_at: new Date().toISOString(),
-    },
-    { onConflict: "chat_id" },
+  const write = () => persistSession(row);
+
+  const ctx = reqCtx.getStore();
+  if (!ctx) {
+    background(write());
+    return;
+  }
+  ctx.sessionWrite = ctx.sessionWrite.then(write).catch((err) =>
+    console.error("session write failed", err)
   );
+  ctx.bg.push(ctx.sessionWrite);
+}
+
+async function persistSession(row: Record<string, unknown>): Promise<void> {
+  const { error } = await supabase
+    .from("chat_sessions")
+    .upsert(row, { onConflict: "chat_id" });
   if (error) throw error;
-  // keep the caller's object in sync so later steps in the same update see it
-  session.worker_id = next.worker_id;
-  session.state = next.state;
-  session.draft = next.draft;
-  return session;
 }
 
 /** Clear transient draft keys, keeping the sticky project. */
@@ -582,14 +654,42 @@ function resetDraft(_draft: Draft): Draft {
 
 // ---------------------------------------------------------------- data access
 
-async function findWorker(telegramUserId: number): Promise<Worker | null> {
-  const { data, error } = await supabase
-    .from("workers")
-    .select("id, full_name, telegram_user_id, telegram_username, status, default_project_id")
-    .eq("telegram_user_id", telegramUserId)
-    .maybeSingle();
+/**
+ * Everything an update needs to know before it can do anything: who sent it,
+ * what they were in the middle of, what the chat is bound to, and whether they
+ * have a record still open. One round trip instead of four — with 30-40 workers
+ * posting at once the serial lookups were most of the warm latency.
+ */
+interface BotContext {
+  worker: Worker | null;
+  session: Session;
+  groupLink: GroupLink | null;
+  openReport: Report | null;
+}
+
+async function loadBotContext(chatId: number, telegramUserId: number): Promise<BotContext> {
+  const { data, error } = await supabase.rpc("bot_context", {
+    p_chat_id: chatId,
+    p_tg_user_id: telegramUserId,
+  });
   if (error) throw error;
-  return (data as Worker) ?? null;
+
+  const ctx = (data ?? {}) as {
+    worker?: Worker | null;
+    session?: Parameters<typeof sessionFromRow>[1];
+    group_link?: GroupLink | null;
+    settings?: Record<string, unknown> | null;
+    open_report?: Report | null;
+  };
+  // the settings cache rides along, so getSettings() almost never reads
+  cacheSettings(ctx.settings);
+
+  return {
+    worker: ctx.worker ?? null,
+    session: sessionFromRow(chatId, ctx.session),
+    groupLink: ctx.group_link ?? null,
+    openReport: ctx.open_report ?? null,
+  };
 }
 
 async function getProject(projectId: number): Promise<Project | null> {
@@ -723,6 +823,7 @@ const HELP_TEXT = [
   "📷 SITE RECORDS",
   "Send photos, videos, files — or just type what happened.",
   "I'll ask which site it's for. A caption becomes the note.",
+  "The record stays open: keep adding, then tap ✅ Done.",
   "",
   "🕘 ATTENDANCE",
   "Check in / Check out share your location to log your hours.",
@@ -748,11 +849,23 @@ function reportButtons(reportId: number): InlineButton[][] {
   ];
 }
 
+/** The buttons an open record carries until the worker says it's finished. */
+function openReportButtons(reportId: number): InlineButton[][] {
+  return [
+    [{ text: "✅ Done", callback_data: `nfin:${reportId}` }],
+    [
+      { text: "📝 Add note", callback_data: `rn:${reportId}` },
+      { text: "📅 Set date", callback_data: `rd:${reportId}` },
+    ],
+    [{ text: "📁 Change site", callback_data: `rp:${reportId}` }],
+  ];
+}
+
 /** Everything a record card states, gathered in one shape. */
 interface RecordCard {
   jobRef: string;
   reportDate: string;
-  note: string | null;
+  notes: ReportNote[];
   code: string;
   name: string;
   mediaTypes: string[];
@@ -762,11 +875,35 @@ function siteLine(c: RecordCard): string {
   return c.name ? `${c.code} — ${c.name}` : c.code;
 }
 
+/** Oldest first — a description reads in the order it was dictated. */
+function sortNotes(notes: ReportNote[]): ReportNote[] {
+  return [...notes].sort((a, b) => a.created_at.localeCompare(b.created_at));
+}
+
+/**
+ * The description, as the separate entries it actually is:
+ *
+ *   Notes
+ *   11:22  big stuffs
+ *   11:23  big stuffs too
+ *
+ * Two sentences typed a minute apart are two facts about two moments; running
+ * them together as one blob loses which was said when.
+ */
+async function notesSection(notes: ReportNote[]): Promise<string> {
+  if (notes.length === 0) return "";
+  const lines: string[] = [];
+  for (const n of notes) lines.push(`${await fmtTime(n.created_at)}  ${oneLine(n.body, 48)}`);
+  return `\n<b>Notes</b>\n<pre>${esc(lines.join("\n"))}</pre>`;
+}
+
 /** One round trip for a record and everything shown alongside it. */
 async function loadRecordCard(reportId: number): Promise<RecordCard | null> {
   const { data, error } = await supabase
     .from("reports")
-    .select("id, job_ref, report_date, note, projects(code, name), report_media(media_type)")
+    .select(
+      "id, job_ref, report_date, projects(code, name), report_media(media_type), report_notes(body, created_at)",
+    )
     .eq("id", reportId)
     .maybeSingle();
   if (error || !data) return null;
@@ -774,14 +911,14 @@ async function loadRecordCard(reportId: number): Promise<RecordCard | null> {
   const row = data as {
     job_ref: string | null;
     report_date: string;
-    note: string | null;
     projects?: { code?: string; name?: string } | null;
     report_media?: { media_type: string }[] | null;
+    report_notes?: ReportNote[] | null;
   };
   return {
     jobRef: row.job_ref ?? "—",
     reportDate: row.report_date,
-    note: row.note,
+    notes: sortNotes(row.report_notes ?? []),
     code: row.projects?.code ?? "site",
     name: row.projects?.name ?? "",
     mediaTypes: (row.report_media ?? []).map((m) => m.media_type),
@@ -808,37 +945,42 @@ async function receiptCard(c: RecordCard, tally: number): Promise<string> {
     ["Ref", c.jobRef],
     ["Site", siteLine(c)],
     ["Date", await fmtDateFull(c.reportDate)],
-    ["Description", c.note ? c.note : "—"],
   ];
+  if (c.notes.length === 0) rows.push(["Description", "—"]);
   if (c.mediaTypes.length > 0) rows.push(["Files", mediaLabel(c.mediaTypes)]);
 
   const footer = [
     c.name ? `Saved to the ${c.name} archive.` : "Saved to the site archive.",
     tally > 0 ? `That's your ${ordinal(tally)} record today. 💪` : "",
   ].filter(Boolean).join("\n");
-  return card("🎉 Record saved", rows, footer);
+  // notes sit between the grid and the footer: they're the record, not a remark
+  return `${card("🎉 Record saved", rows)}${await notesSection(c.notes)}\n${esc(footer)}`;
 }
 
-/** Receipt for a record we already hold in memory — no re-read of the row. */
-async function sendReportConfirmation(
-  chatId: number,
-  report: Report,
-  project: Project,
-  workerId: number,
-  mediaTypes: string[],
-): Promise<void> {
-  const c: RecordCard = {
-    jobRef: report.job_ref ?? "—",
-    reportDate: report.report_date,
-    note: report.note,
-    code: project.code,
-    name: project.name,
-    mediaTypes,
-  };
-  await send(chatId, await receiptCard(c, await recordsToday(workerId)), {
-    parse_mode: "HTML",
-    reply_markup: { inline_keyboard: reportButtons(report.id) },
-  });
+const OPEN_RECORD_HINT = "Still open — send more photos or notes, then tap ✅ Done.";
+
+/**
+ * A record that hasn't been closed yet. It exists because the old flow sealed a
+ * record the moment a description arrived: a worker who sent six photos and then
+ * remembered the caption ended up with two half-records. Nothing is final until
+ * they say so, and every addition re-renders this same card.
+ */
+async function openRecordCard(c: RecordCard, worker: Worker): Promise<string> {
+  const rows: [string, string][] = [
+    ["Ref", c.jobRef],
+    ["Site", siteLine(c)],
+    ["Date", await fmtDateFull(c.reportDate)],
+    ["Filed by", worker.full_name],
+  ];
+  if (c.mediaTypes.length > 0) rows.push(["Files", mediaLabel(c.mediaTypes)]);
+
+  const summary = [
+    c.mediaTypes.length > 0 ? mediaLabel(c.mediaTypes) : "no files yet",
+    `${c.notes.length} note${c.notes.length === 1 ? "" : "s"}`,
+  ].join(" · ");
+  return `${card("📋 Record — still open", rows)}${await notesSection(c.notes)}\n${
+    esc(`${summary} so far.`)
+  }\n${esc(OPEN_RECORD_HINT)}`;
 }
 
 /**
@@ -860,46 +1002,144 @@ async function newRecordPrompt(
   return `${card(title, rows)}\n📁 Which site is this for?`;
 }
 
+// ---------------------------------------------------------------- open records
+//
+// A DM record is a conversation, not a form submission: it opens on the first
+// thing sent, absorbs everything that follows, and closes only when the worker
+// taps ✅ Done. A group record never opens — the crew posts and moves on.
+
+/** An open record left alone this long is finished in all but name. */
+const OPEN_RECORD_STALE_MS = 30 * 60_000;
+
+/** Notes are rows now — the reports.note mirror is maintained by a trigger. */
+async function addNote(reportId: number, workerId: number, body: string): Promise<void> {
+  const text = body.trim();
+  if (!text) return;
+  const { error } = await supabase.from("report_notes").insert({
+    report_id: reportId,
+    worker_id: workerId,
+    body: text.slice(0, 2000),
+  });
+  if (error) throw error;
+}
+
+/** The record's newest note, for prompts that quote what's already there. */
+async function latestNote(reportId: number): Promise<string | null> {
+  const { data, error } = await supabase
+    .from("report_notes")
+    .select("body")
+    .eq("report_id", reportId)
+    .order("created_at", { ascending: false })
+    .limit(1);
+  if (error) throw error;
+  return (data?.[0]?.body as string) ?? null;
+}
+
+/** Finalise — never delete. The files are real work whatever the worker meant. */
+async function closeReport(reportId: number, workerId: number): Promise<void> {
+  const { error } = await supabase
+    .from("reports")
+    .update({ status: "final", closed_at: new Date().toISOString() })
+    .eq("id", reportId)
+    .eq("worker_id", workerId);
+  if (error) throw error;
+}
+
 /**
- * Always ask for a description after files land, but never block on it — an
- * unlabelled photo is far worse than an empty note, and a worker on scaffolding
- * needs one tap to move on. Typing the answer or tapping Skip both end here.
- *
- * The card leads with what the bot captured by itself, so the one question it
- * does ask reads as the only thing left rather than the start of a form.
+ * The record a worker's next photo should join, or null to start a fresh one.
+ * A record nobody has touched for half an hour belongs to a job that's over —
+ * close it quietly rather than filing tomorrow's wall into yesterday's pour.
  */
-async function askForDetails(
+function liveOpenReport(report: Report | null): Report | null {
+  if (!report) return null;
+  const stamps = [report.updated_at, report.created_at]
+    .map((t) => Date.parse(t ?? ""))
+    .filter((t) => Number.isFinite(t));
+  if (stamps.length === 0) return report; // no clock to judge it by — leave it open
+  if (Date.now() - Math.max(...stamps) > OPEN_RECORD_STALE_MS) {
+    background(closeReport(report.id, report.worker_id));
+    return null;
+  }
+  return report;
+}
+
+/**
+ * Render the open record and remember which message holds it, so the next photo
+ * edits that card instead of stacking another one under it. `messageId` is the
+ * card to reuse — the site picker on the way in, the card itself afterwards.
+ * `resend` is off for album parts: eight of them land at once and a failed edit
+ * would turn into eight fresh cards. `queued` is on when the message being
+ * rewritten is the one whose button we're answering — it exists by definition,
+ * so the edit can ride the webhook response instead of costing a round trip.
+ */
+async function showOpenRecord(
   chatId: number,
+  messageId: number | undefined,
+  worker: Worker,
+  session: Session,
+  reportId: number,
+  { resend = true, queued = false }: { resend?: boolean; queued?: boolean } = {},
+): Promise<void> {
+  const c = await loadRecordCard(reportId);
+  if (!c) return;
+  const text = await openRecordCard(c, worker);
+  const reply_markup = { inline_keyboard: openReportButtons(reportId) };
+
+  if (queued && messageId !== undefined) {
+    await edit(chatId, messageId, text, { parse_mode: "HTML", reply_markup });
+    saveSessionSoon(session, {
+      state: "idle",
+      draft: { report_id: reportId, card_message_id: messageId },
+    });
+    return;
+  }
+
+  let cardId = messageId;
+  if (cardId !== undefined) {
+    const ok = await tg("editMessageText", {
+      chat_id: chatId,
+      message_id: cardId,
+      text,
+      parse_mode: "HTML",
+      reply_markup,
+    });
+    if (!ok) cardId = undefined;
+  }
+  if (cardId === undefined && (resend || messageId === undefined)) {
+    const sent = await tg("sendMessage", {
+      chat_id: chatId,
+      text,
+      parse_mode: "HTML",
+      reply_markup,
+    });
+    cardId = (sent?.message_id as number) ?? undefined;
+  }
+
+  saveSessionSoon(session, {
+    state: "idle",
+    draft: { report_id: reportId, card_message_id: cardId },
+  });
+}
+
+/**
+ * One worker, one open record. Opening a new one closes whatever was still
+ * open, quietly and off the reply path — two open records would mean the next
+ * photo had two homes and no rule for choosing.
+ */
+function closePrevious(previous: Report | null, newId: number, workerId: number): void {
+  if (previous && previous.id !== newId) background(closeReport(previous.id, workerId));
+}
+
+/** Typed text while a record is open: one more note on it, not a new record. */
+async function joinOpenRecord(
+  chatId: number,
+  worker: Worker,
   session: Session,
   report: Report,
-  project: Project,
-  worker: Worker,
-  mediaTypes: string[],
+  text: string,
 ): Promise<void> {
-  await saveSession(session, {
-    state: "adding_note",
-    draft: { ...session.draft, report_id: report.id },
-  });
-
-  const rows: [string, string][] = [
-    ["Site", `${project.code} — ${project.name}`],
-    ["Date", `${await fmtDateFull(report.report_date)}, ${await fmtTime(new Date())}`],
-    ["Filed by", worker.full_name],
-    ["Files", mediaLabel(mediaTypes)],
-  ];
-  const body = card(`📋 Record ${report.job_ref ?? ""}`.trim(), rows, "✅ Captured automatically — nothing to type.") +
-    "\n\n📝 What's this about? Type a short description, or tap Skip.";
-
-  await send(chatId, body, {
-    parse_mode: "HTML",
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "⏭ Skip — no description", callback_data: `nskip:${report.id}` }],
-        // wrong site is caught here, at the moment they can still see the batch
-        [{ text: "📁 Wrong site? Move it", callback_data: `rp:${report.id}` }],
-      ],
-    },
-  });
+  await addNote(report.id, worker.id, text);
+  await showOpenRecord(chatId, session.draft.card_message_id, worker, session, report.id);
 }
 
 // ---------------------------------------------------------------- entrypoint
@@ -929,7 +1169,7 @@ Deno.serve(async (req) => {
   if (debug) traceReset();
   const t0 = performance.now();
 
-  const ctx: ReqCtx = { queue: [], bg: [] };
+  const ctx: ReqCtx = { queue: [], bg: [], sessionWrite: Promise.resolve() };
   let failed: unknown = null;
   try {
     await reqCtx.run(ctx, () => handleUpdate(update));
@@ -984,22 +1224,28 @@ function handleUpdate(update: TgUpdate): Promise<void> {
 async function handleMessage(message: TgMessage): Promise<void> {
   const from = message.from;
   if (!from || !message.chat?.id) return;
-  if (isGroupChat(message.chat)) return handleGroupMessage(message, from);
+  const group = isGroupChat(message.chat);
+  // our own posts and other bots are not site records — decided before any read
+  if (group && from.is_bot) return;
   // Anything else (channels) has no sender to attribute work to.
-  if (message.chat.type && message.chat.type !== "private") return;
+  if (!group && message.chat.type && message.chat.type !== "private") return;
 
   const chatId = message.chat.id;
-  // independent lookups — one round trip to the DB instead of two in series
-  const [session, worker] = await Promise.all([getSession(chatId), findWorker(from.id)]);
+  // worker + session + group link + settings + open record, in one round trip
+  const ctx = await loadBotContext(chatId, from.id);
+  // A group session is shared by everyone in the chat, so group handling never
+  // reads it — only the pieces below are passed through.
+  if (group) return handleGroupMessage(message, from, ctx.groupLink, ctx.worker);
 
-  if (!worker) return handleUnregistered(chatId, session, message, from);
+  const { session, worker } = ctx;
+  if (!worker) return handleUnregistered(chatId, session, from);
 
   if (session.worker_id !== worker.id) {
-    await saveSession(session, { worker_id: worker.id });
+    saveSessionSoon(session, { worker_id: worker.id });
   }
 
   if (worker.status === "pending") {
-    await send(chatId, "Your registration is awaiting admin approval.");
+    await send(chatId, "Your account is not active. Contact your admin.");
     return;
   }
   if (worker.status === "disabled") {
@@ -1007,13 +1253,18 @@ async function handleMessage(message: TgMessage): Promise<void> {
     return;
   }
 
+  // A record the worker hasn't closed yet swallows everything that follows it.
+  const openReport = liveOpenReport(ctx.openReport);
+
   const command = parseCommand(message.text);
-  if (command) return handleCommand(command, chatId, worker, session);
+  if (command) return handleCommand(command, chatId, worker, session, openReport);
 
   if (message.location) return handleLocation(chatId, worker, session, message.location);
 
   const media = extractMedia(message);
-  if (media) return handleIncomingMedia(chatId, worker, session, media, message.caption ?? null);
+  if (media) {
+    return handleIncomingMedia(chatId, worker, session, media, message.caption ?? null, openReport);
+  }
 
   const text = (message.text ?? "").trim();
   if (!text) return;
@@ -1024,7 +1275,7 @@ async function handleMessage(message: TgMessage): Promise<void> {
   // that silently became a note is how people got stuck mid-flow. A typed
   // description that reads exactly like a button label is the accepted loss.
   const tapped = buttonCommand(text);
-  if (tapped) return handleCommand(tapped, chatId, worker, session);
+  if (tapped) return handleCommand(tapped, chatId, worker, session, openReport);
 
   switch (session.state) {
     case "awaiting_checkin_location":
@@ -1035,7 +1286,7 @@ async function handleMessage(message: TgMessage): Promise<void> {
       return;
     case "awaiting_record":
       // no media came — the typed text IS the record
-      return startTextRecord(chatId, worker, session, text);
+      return startTextRecord(chatId, worker, session, text, openReport);
     case "adding_note":
       return saveNoteFromText(chatId, worker, session, text);
     case "typing_date":
@@ -1052,8 +1303,11 @@ async function handleMessage(message: TgMessage): Promise<void> {
     case "ts_typing_loc":
       return tsTypedLocation(chatId, session, text);
     default:
-      // a pasted crew list is a timesheet even without the command
+      // a pasted crew list is a timesheet even without the command — and even
+      // mid-record: a roster is a different document, not a note about one
       if (looksLikeTimesheet(text)) return startTimesheet(chatId, session, text);
+      // anything else typed while a record is open belongs to that record
+      if (openReport) return joinOpenRecord(chatId, worker, session, openReport, text);
       await send(chatId, HELP_TEXT);
   }
 }
@@ -1085,41 +1339,25 @@ async function claimPreregistered(from: TgUser): Promise<Worker | null> {
 async function handleUnregistered(
   chatId: number,
   session: Session,
-  message: TgMessage,
   from: TgUser,
 ): Promise<void> {
   const claimed = await claimPreregistered(from);
   if (claimed) {
-    await saveSession(session, { worker_id: claimed.id, state: "idle", draft: {} });
+    saveSessionSoon(session, { worker_id: claimed.id, state: "idle", draft: {} });
     await send(
       chatId,
       claimed.status === "active"
         ? `Welcome, ${claimed.full_name}. Your account is already set up.\n\n${HELP_TEXT}`
-        : `Welcome, ${claimed.full_name}. Your account is awaiting admin approval.`,
+        : `Welcome, ${claimed.full_name}. Your account is not active. Contact your admin.`,
     );
     return;
   }
 
-  const text = (message.text ?? "").trim();
-
-  if (session.state === "registering" && text && !text.startsWith("/")) {
-    const { error } = await supabase.from("workers").insert({
-      full_name: text.slice(0, 120),
-      telegram_user_id: from.id,
-      telegram_username: from.username ?? null,
-      status: "pending",
-    });
-    if (error) throw error;
-    await saveSession(session, { state: "idle", draft: {} });
-    await send(
-      chatId,
-      `Thanks, ${text.slice(0, 120)}. Your account has been created — an admin needs to approve it before you can send reports.`,
-    );
-    return;
-  }
-
-  await saveSession(session, { state: "registering", draft: {} });
-  await send(chatId, "Welcome to CL Automation. Please send your full name to register.");
+  saveSessionSoon(session, { state: "idle", draft: {} });
+  await send(
+    chatId,
+    "Your Telegram account is not set up. Ask an admin to add your Telegram username.",
+  );
 }
 
 // ---------------------------------------------------------------- group mode
@@ -1185,70 +1423,48 @@ async function groupLinkKeyboard(): Promise<InlineButton[][] | null> {
 }
 
 /**
- * The sender of a group message, creating a pending worker if we've never seen
- * them. A photo of a live defect is worth more than a tidy worker table, so an
- * unregistered sender is never a reason to drop a file — the admin approves the
- * row later and the reports are already attributed to it.
+ * Resolve only workers provisioned by an admin; group activity never creates
+ * users. `known` is what bot_context already found for this Telegram id.
  */
-async function resolveGroupSender(from: TgUser): Promise<Worker> {
-  const existing = await findWorker(from.id);
-  if (existing) return existing;
-
-  const name = `${from.first_name ?? ""}${from.last_name ? ` ${from.last_name}` : ""}`.trim();
-  const fullName = name || (from.username ? `@${from.username}` : `Telegram ${from.id}`);
-
-  const { data, error } = await supabase
-    .from("workers")
-    .insert({
-      full_name: fullName.slice(0, 120),
-      telegram_user_id: from.id,
-      telegram_username: from.username ?? null,
-      status: "pending",
-    })
-    .select("id, full_name, telegram_user_id, telegram_username, status, default_project_id")
-    .single();
-  if (!error) return data as Worker;
-
-  // two album parts raced the same first-ever sender → adopt the winner's row
-  if (error.code === "23505") {
-    const raced = await findWorker(from.id);
-    if (raced) return raced;
-  }
-  throw error;
+async function resolveGroupSender(from: TgUser, known: Worker | null): Promise<Worker | null> {
+  const worker = known ?? await claimPreregistered(from);
+  return worker?.status === "active" ? worker : null;
 }
 
-async function handleGroupMessage(message: TgMessage, from: TgUser): Promise<void> {
-  if (from.is_bot) return; // our own posts and other bots are not site records
-
-  const link = await getGroupLink(message.chat.id);
-
+function handleGroupMessage(
+  message: TgMessage,
+  from: TgUser,
+  link: GroupLink | null,
+  sender: Worker | null,
+): Promise<void> {
   const command = parseCommand(message.text);
-  if (command) return handleGroupCommand(command, message, from, link);
+  if (command) return handleGroupCommand(command, message, link, sender);
 
   const media = extractMedia(message);
-  if (media) return handleGroupMedia(message, from, link, media);
-
-  if (!link) return;
+  if (media) return handleGroupMedia(message, from, link, sender, media);
 
   // Crew chatter is not a report. The one exception is a pasted crew list —
   // that is a document someone would otherwise have to re-send in a DM.
   const text = (message.text ?? "").trim();
-  if (text && looksLikeTimesheet(text)) return groupTimesheet(message, from, link, text);
+  if (link && text && looksLikeTimesheet(text)) {
+    return groupTimesheet(message, from, link, sender, text);
+  }
+  return Promise.resolve();
 }
 
 async function handleGroupCommand(
   command: string,
   message: TgMessage,
-  from: TgUser,
   link: GroupLink | null,
+  sender: Worker | null,
 ): Promise<void> {
   const chatId = message.chat.id;
 
   switch (command) {
     case "link":
-      return groupStartLink(message, from);
+      return groupStartLink(message, sender);
     case "unlink":
-      return groupUnlink(message, from, link);
+      return groupUnlink(message, sender, link);
     case "checkin":
     case "checkout":
       await replyTo(chatId, message.message_id, GROUP_DM_ONLY);
@@ -1264,9 +1480,8 @@ async function handleGroupCommand(
   }
 }
 
-async function groupStartLink(message: TgMessage, from: TgUser): Promise<void> {
+async function groupStartLink(message: TgMessage, worker: Worker | null): Promise<void> {
   const chatId = message.chat.id;
-  const worker = await findWorker(from.id);
   if (!worker || worker.status !== "active") {
     await replyTo(chatId, message.message_id, GROUP_NOT_A_WORKER);
     return;
@@ -1283,11 +1498,10 @@ async function groupStartLink(message: TgMessage, from: TgUser): Promise<void> {
 
 async function groupUnlink(
   message: TgMessage,
-  from: TgUser,
+  worker: Worker | null,
   link: GroupLink | null,
 ): Promise<void> {
   const chatId = message.chat.id;
-  const worker = await findWorker(from.id);
   if (!worker || worker.status !== "active") {
     await replyTo(chatId, message.message_id, GROUP_NOT_A_WORKER);
     return;
@@ -1335,7 +1549,7 @@ async function findRecentGroupReport(
   const since = new Date(Date.now() - GROUP_REPORT_WINDOW_MS).toISOString();
   const { data, error } = await supabase
     .from("reports")
-    .select("id, project_id, worker_id, report_date, note, job_ref")
+    .select(REPORT_COLS)
     .eq("worker_id", workerId)
     .eq("project_id", projectId)
     .is("album_group_id", null)
@@ -1348,16 +1562,16 @@ async function findRecentGroupReport(
 
 /** Append a later caption instead of overwriting: both sentences were typed. */
 async function appendGroupNote(report: Report, caption: string): Promise<void> {
-  const note = report.note ? `${report.note}\n${caption}` : caption;
-  const { error } = await supabase.from("reports").update({ note }).eq("id", report.id);
-  if (error) throw error;
-  report.note = note;
+  await addNote(report.id, report.worker_id, caption);
+  // keep the in-memory mirror in step with the trigger's
+  report.note = report.note ? `${report.note}\n${caption}` : caption;
 }
 
 async function handleGroupMedia(
   message: TgMessage,
   from: TgUser,
   link: GroupLink | null,
+  sender: Worker | null,
   media: MediaDescriptor,
 ): Promise<void> {
   const chatId = message.chat.id;
@@ -1383,7 +1597,11 @@ async function handleGroupMedia(
     return;
   }
 
-  const sender = await resolveGroupSender(from);
+  const filer = await resolveGroupSender(from, sender);
+  if (!filer) {
+    await replyTo(chatId, message.message_id, GROUP_NOT_A_WORKER);
+    return;
+  }
 
   let report: Report | null = null;
   let created = false;
@@ -1395,14 +1613,14 @@ async function handleGroupMedia(
     // update. A CAPTIONED single is a NEW status ("pour done, no defects") and
     // must stand as its own report, even a minute after the last one; crews
     // post several distinct statuses per site per day.
-    report = await findRecentGroupReport(sender.id, link.project_id);
+    report = await findRecentGroupReport(filer.id, link.project_id);
   }
 
   if (report) {
     if (caption) await appendGroupNote(report, caption);
   } else {
     const fresh = await createReport(
-      sender.id,
+      filer.id,
       link.project_id,
       caption,
       media.media_group_id ?? null,
@@ -1432,6 +1650,7 @@ async function groupTimesheet(
   message: TgMessage,
   from: TgUser,
   link: GroupLink,
+  sender: Worker | null,
   text: string,
 ): Promise<void> {
   const chatId = message.chat.id;
@@ -1450,7 +1669,11 @@ async function groupTimesheet(
     if (del.error) throw del.error;
   }
 
-  const sender = await resolveGroupSender(from);
+  const filer = await resolveGroupSender(from, sender);
+  if (!filer) {
+    await replyTo(chatId, message.message_id, GROUP_NOT_A_WORKER);
+    return;
+  }
   const { data, error } = await supabase
     .from("timesheets")
     .insert({
@@ -1458,7 +1681,7 @@ async function groupTimesheet(
       team_number: sheet.teamNumber,
       location: sheet.location,
       project_id: link.project_id,
-      submitted_by: sender.id,
+      submitted_by: filer.id,
       raw_text: text.slice(0, 4000),
     })
     .select("id")
@@ -1497,6 +1720,7 @@ async function handleGroupCallback(
   query: TgCallbackQuery,
   chatId: number,
   messageId: number | undefined,
+  worker: Worker | null,
 ): Promise<void> {
   const parts = (query.data ?? "").split(":");
   if (parts[0] !== "gl") {
@@ -1505,7 +1729,6 @@ async function handleGroupCallback(
     return;
   }
 
-  const worker = await findWorker(query.from.id);
   if (!worker || worker.status !== "active") {
     await answerCallback(query.id, GROUP_NOT_A_WORKER);
     return;
@@ -1549,6 +1772,7 @@ async function handleCommand(
   chatId: number,
   worker: Worker,
   session: Session,
+  openReport: Report | null,
 ): Promise<void> {
   switch (command) {
     case "start":
@@ -1563,18 +1787,23 @@ async function handleCommand(
       if (pend?.length) {
         await supabase.from("pending_media").delete().eq("chat_id", chatId);
       }
-      await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
+      // An open record is closed, never dropped: its files are already archived
+      // and a worker cancelling a flow is not asking to unfile real work.
+      if (openReport) await closeReport(openReport.id, worker.id);
+      saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
       await send(
         chatId,
         pend?.length
           ? `Cancelled — discarded ${pend.length} unsaved file(s).`
+          : openReport
+          ? `Closed ${openReport.job_ref ?? "that record"} as it stands.`
           : "Cancelled.",
         { reply_markup: MAIN_KEYBOARD },
       );
       return;
     }
     case "send":
-      return cmdSend(chatId, session);
+      return cmdSend(chatId, session, openReport);
     case "status":
       return cmdStatus(chatId, worker, session);
     case "today":
@@ -1595,12 +1824,20 @@ async function handleCommand(
  * text on its own. Forcing an image on someone whose whole update is "no
  * leakages, all good" just loses that update.
  */
-async function cmdSend(chatId: number, session: Session): Promise<void> {
-  await saveSession(session, { state: "awaiting_record", draft: resetDraft(session.draft) });
+async function cmdSend(chatId: number, session: Session, openReport: Report | null): Promise<void> {
+  // A record still open keeps its card link, so whatever comes next edits that
+  // card instead of leaving a stale one above a fresh copy.
+  saveSessionSoon(session, {
+    state: "awaiting_record",
+    draft: openReport ? session.draft : resetDraft(session.draft),
+  });
   await send(
     chatId,
-    `📷 Attach photos, videos or files (📎 below) — or just type what happened.\n` +
-      `I'll ask which site it's for.`,
+    openReport
+      ? `📷 Attach photos, videos or files (📎 below) — or just type what happened.\n` +
+        `It goes on ${openReport.job_ref ?? "your open record"} until you tap ✅ Done.`
+      : `📷 Attach photos, videos or files (📎 below) — or just type what happened.\n` +
+        `I'll ask which site it's for.`,
     { reply_markup: MAIN_KEYBOARD },
   );
 }
@@ -1611,16 +1848,19 @@ async function startTextRecord(
   worker: Worker,
   session: Session,
   text: string,
+  openReport: Report | null,
 ): Promise<void> {
   // "Send records" then a pasted crew list is a timesheet, not a note about one.
   if (looksLikeTimesheet(text)) return startTimesheet(chatId, session, text);
+  // a record still open takes the words: one update, not two half ones
+  if (openReport) return joinOpenRecord(chatId, worker, session, openReport, text);
 
   const rows = await projectKeyboard(worker.id, "pjm");
   if (!rows) {
     await send(chatId, "No active projects yet. Ask your admin to set one up.");
     return;
   }
-  await saveSession(session, {
+  saveSessionSoon(session, {
     state: "choosing_project_for_media",
     draft: { ...resetDraft(session.draft), pending_note: text.slice(0, 2000) },
   });
@@ -1692,7 +1932,9 @@ async function cmdToday(chatId: number, worker: Worker): Promise<void> {
   const [reports, attRows] = await Promise.all([
     supabase
       .from("reports")
-      .select("id, job_ref, note, created_at, projects(code), report_media(media_type)")
+      .select(
+        "id, job_ref, created_at, projects(code), report_media(media_type), report_notes(body, created_at)",
+      )
       .eq("worker_id", worker.id)
       .eq("report_date", today)
       .order("created_at", { ascending: false }),
@@ -1702,12 +1944,12 @@ async function cmdToday(chatId: number, worker: Worker): Promise<void> {
 
   const rows = ((reports.data ?? []) as {
     job_ref: string | null;
-    note: string | null;
     projects?: { code?: string } | null;
     report_media?: { media_type: string }[] | null;
+    report_notes?: ReportNote[] | null;
   }[]).map((r) => ({
     jobRef: r.job_ref ?? "—",
-    note: r.note,
+    notes: sortNotes(r.report_notes ?? []),
     code: r.projects?.code ?? "site",
     types: (r.report_media ?? []).map((m) => m.media_type),
   }));
@@ -1736,7 +1978,13 @@ async function cmdToday(chatId: number, worker: Worker): Promise<void> {
   const listed = rows.slice(0, TODAY_LIST_LIMIT).map((r) => {
     const parts = [esc(r.jobRef), esc(r.code)];
     if (r.types.length > 0) parts.push(esc(mediaLabel(r.types)));
-    parts.push(r.note ? `“${esc(oneLine(r.note, 40))}”` : "no description");
+    // one line per record here, so it quotes the latest note and counts the rest
+    const latest = r.notes[r.notes.length - 1];
+    parts.push(
+      latest
+        ? `“${esc(oneLine(latest.body, 40))}”${r.notes.length > 1 ? ` (+${r.notes.length - 1} more)` : ""}`
+        : "no description",
+    );
     return `• ${parts.join(" · ")}`;
   });
   if (rows.length > listed.length) {
@@ -1759,7 +2007,7 @@ async function cmdCheckin(chatId: number, worker: Worker, session: Session): Pro
     );
     return;
   }
-  await saveSession(session, { state: "awaiting_checkin_location" });
+  saveSessionSoon(session, { state: "awaiting_checkin_location" });
   await send(chatId, "Tap to share your location — required to check in.", {
     reply_markup: LOCATION_KEYBOARD,
   });
@@ -1771,7 +2019,7 @@ async function cmdCheckout(chatId: number, worker: Worker, session: Session): Pr
     await send(chatId, "You're not checked in. Use /checkin.");
     return;
   }
-  await saveSession(session, { state: "awaiting_checkout_location" });
+  saveSessionSoon(session, { state: "awaiting_checkout_location" });
   await send(chatId, "Tap to share your location — required to check out.", {
     reply_markup: LOCATION_KEYBOARD,
   });
@@ -1819,7 +2067,7 @@ async function doCheckin(
 ): Promise<void> {
   const existing = await openAttendance(worker.id);
   if (existing) {
-    await saveSession(session, { state: "idle" });
+    saveSessionSoon(session, { state: "idle" });
     await send(
       chatId,
       `Already checked in since ${await fmtTime(existing.check_in_at)}. Use /checkout first.`,
@@ -1846,7 +2094,7 @@ async function doCheckin(
     .single();
   if (error) throw error;
 
-  await saveSession(session, { state: "idle" });
+  saveSessionSoon(session, { state: "idle" });
 
   // Attendance only. Where photos file is a separate, worker-chosen setting and
   // is deliberately not mentioned here — conflating the two is what made people
@@ -1867,7 +2115,7 @@ async function doCheckout(
 ): Promise<void> {
   const open = await openAttendance(worker.id);
   if (!open) {
-    await saveSession(session, { state: "idle" });
+    saveSessionSoon(session, { state: "idle" });
     await send(chatId, "You're not checked in. Use /checkin.", { reply_markup: MAIN_KEYBOARD });
     return;
   }
@@ -1894,7 +2142,7 @@ async function doCheckout(
     .eq("id", open.id);
   if (error) throw error;
 
-  await saveSession(session, { state: "idle" });
+  saveSessionSoon(session, { state: "idle" });
 
   const worked = fmtDuration(checkOutAt.getTime() - new Date(open.check_in_at).getTime());
   const rows: [string, string][] = [
@@ -2009,7 +2257,7 @@ function extractMedia(message: TgMessage): MediaDescriptor | null {
 async function ownedReport(reportId: number, workerId: number): Promise<Report | null> {
   const { data, error } = await supabase
     .from("reports")
-    .select("id, project_id, worker_id, report_date, note, job_ref")
+    .select(REPORT_COLS)
     .eq("id", reportId)
     .eq("worker_id", workerId)
     .maybeSingle();
@@ -2023,7 +2271,7 @@ const NOT_YOURS = "That report was filed by someone else — only they can edit 
 async function findAlbumReport(groupId: string): Promise<Report | null> {
   const { data, error } = await supabase
     .from("reports")
-    .select("id, project_id, worker_id, report_date, note, job_ref")
+    .select(REPORT_COLS)
     .eq("album_group_id", groupId)
     .maybeSingle();
   if (error) throw error;
@@ -2039,6 +2287,7 @@ async function handleIncomingMedia(
   session: Session,
   media: MediaDescriptor,
   caption: string | null,
+  openReport: Report | null,
 ): Promise<void> {
   // Part 2+ of an album whose report already exists → attach silently.
   if (media.media_group_id) {
@@ -2046,25 +2295,42 @@ async function handleIncomingMedia(
     if (report) {
       const ok = await storeMedia(report, media);
       if (!ok) await send(chatId, RESEND_WARNING);
-      if (caption && report.note === null) {
-        await supabase.from("reports").update({ note: caption }).eq("id", report.id);
-      }
+      if (caption && report.note === null) await addNote(report.id, worker.id, caption);
       return;
     }
   }
 
-  // Still answering "what's this about?" for the last batch → these files are
-  // part of the same batch. Workers send photos one at a time constantly; a new
-  // report (and a second prompt) per photo is how you train them to ignore the
-  // prompt entirely.
+  // A record the worker hasn't closed keeps taking files, however long they take
+  // to send them. This is the whole point of the open lifecycle: photos arriving
+  // one at a time are one update, and it is theirs to end.
+  if (openReport) {
+    const ok = await storeMedia(openReport, media);
+    if (!ok) {
+      await send(chatId, RESEND_WARNING);
+      return;
+    }
+    if (caption) await addNote(openReport.id, worker.id, caption);
+    await showOpenRecord(
+      chatId,
+      session.draft.card_message_id,
+      worker,
+      session,
+      openReport.id,
+      { resend: !media.media_group_id },
+    );
+    return;
+  }
+
+  // Answering "add a note" for an earlier, already-closed record → the files
+  // still belong to that record rather than opening a second one.
   if (session.state === "adding_note" && session.draft.report_id) {
-    const open = await ownedReport(session.draft.report_id, worker.id);
-    if (open) {
-      const ok = await storeMedia(open, media);
+    const target = await ownedReport(session.draft.report_id, worker.id);
+    if (target) {
+      const ok = await storeMedia(target, media);
       if (!ok) await send(chatId, RESEND_WARNING);
-      if (caption && open.note === null) {
-        await supabase.from("reports").update({ note: caption }).eq("id", open.id);
-        await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
+      if (caption) {
+        await addNote(target.id, worker.id, caption);
+        saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
       }
       return;
     }
@@ -2087,7 +2353,7 @@ async function handleIncomingMedia(
       await send(chatId, "No active projects yet. Ask your admin to set one up.");
       return;
     }
-    await saveSession(session, {
+    saveSessionSoon(session, {
       state: "choosing_project_for_media",
       draft: { ...session.draft, pending_group: media.media_group_id },
     });
@@ -2118,6 +2384,7 @@ async function createReport(
   projectId: number,
   note: string | null,
   albumGroupId: string | null = null,
+  status: "open" | "final" = "final",
 ): Promise<{ report: Report; created: boolean }> {
   const { data, error } = await supabase
     .from("reports")
@@ -2125,18 +2392,27 @@ async function createReport(
       project_id: projectId,
       worker_id: workerId,
       report_date: await localDate(),
-      note: note && note.trim() ? note.trim() : null,
       album_group_id: albumGroupId,
+      status,
     })
-    .select("id, project_id, worker_id, report_date, note, job_ref")
+    .select(REPORT_COLS)
     .single();
-  if (!error) return { report: data as Report, created: true };
-
-  if (error.code === "23505" && albumGroupId) {
-    const existing = await findAlbumReport(albumGroupId);
-    if (existing) return { report: existing, created: false };
+  if (error) {
+    if (error.code === "23505" && albumGroupId) {
+      const existing = await findAlbumReport(albumGroupId);
+      if (existing) return { report: existing, created: false };
+    }
+    throw error;
   }
-  throw error;
+
+  // reports.note is a trigger-maintained mirror now — the first caption is a
+  // note row like every one after it.
+  const report = data as Report;
+  if (note && note.trim()) {
+    await addNote(report.id, workerId, note);
+    report.note = note.trim();
+  }
+  return { report, created: true };
 }
 
 /**
@@ -2206,30 +2482,28 @@ async function saveNoteFromText(
 ): Promise<void> {
   const reportId = session.draft.report_id;
   if (!reportId) {
-    await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
+    saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
     await send(chatId, "That report is no longer open. Send the media again to start over.");
     return;
   }
 
   // "Add note" must ADD. Overwriting silently destroyed what the worker typed
-  // earlier — the one thing a record keeper must never do. Existing text is
-  // kept and the new line appended; corrections happen in the dashboard.
+  // earlier — the one thing a record keeper must never do. Each note is its own
+  // timestamped row; corrections happen in the dashboard.
   const existing = await ownedReport(reportId, worker.id);
   if (!existing) {
-    await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
+    saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
     await send(chatId, NOT_YOURS);
     return;
   }
-  const note = existing.note && existing.note.trim() ? `${existing.note}\n${text}` : text;
+  await addNote(reportId, worker.id, text);
 
-  const { error } = await supabase
-    .from("reports")
-    .update({ note })
-    .eq("id", reportId)
-    .eq("worker_id", worker.id);
-  if (error) throw error;
+  // a record still open goes back to its own card, not to a receipt
+  if (existing.status === "open") {
+    return showOpenRecord(chatId, session.draft.card_message_id, worker, session, reportId);
+  }
 
-  await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
+  saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
   // hand back the finished card so they can still fix the date or site
   await send(chatId, await recordReceipt(reportId, worker.id), {
     parse_mode: "HTML",
@@ -2244,31 +2518,31 @@ async function recordReceipt(reportId: number, workerId: number): Promise<string
   return await receiptCard(c, tally);
 }
 
-/** "Skip" on the details prompt: close it out, leave the note null. */
-async function cbSkipDetails(
+/**
+ * ✅ Done: the worker says the record is complete. Finalising and reading the
+ * receipt back run together, and the card they tapped becomes that receipt — so
+ * closing a record costs no Telegram round trip at all.
+ */
+async function cbFinishRecord(
   chatId: number,
   messageId: number | undefined,
   session: Session,
   worker: Worker,
   reportId: number,
 ): Promise<void> {
-  await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
-  const text = await recordReceipt(reportId, worker.id);
-  if (messageId) {
-    // the question becomes its own answer, so the chat reads as a transcript
-    await tg("editMessageText", {
-      chat_id: chatId,
-      message_id: messageId,
-      text,
-      parse_mode: "HTML",
-      reply_markup: { inline_keyboard: reportButtons(reportId) },
-    });
-  } else {
-    await send(chatId, text, {
-      parse_mode: "HTML",
-      reply_markup: { inline_keyboard: reportButtons(reportId) },
-    });
-  }
+  const [, text] = await Promise.all([
+    closeReport(reportId, worker.id),
+    recordReceipt(reportId, worker.id),
+  ]);
+  saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
+
+  const extra = {
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: reportButtons(reportId) },
+  };
+  // the open card becomes its own answer, so the chat reads as a transcript
+  if (messageId) await edit(chatId, messageId, text, extra);
+  else await send(chatId, text, extra);
 }
 
 /** Accepts YYYY-MM-DD or DD/MM/YYYY; returns an ISO date or null. */
@@ -2311,7 +2585,7 @@ async function saveDateFromText(
 ): Promise<void> {
   const reportId = session.draft.report_id;
   if (!reportId) {
-    await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
+    saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
     await send(chatId, "That report is no longer open. Send the media again to start over.");
     return;
   }
@@ -2329,7 +2603,7 @@ async function saveDateFromText(
     .eq("worker_id", worker.id);
   if (error) throw error;
 
-  await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
+  saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
   await send(chatId, `✅ Date set to ${await fmtDate(parsed)}.`);
 }
 
@@ -2349,7 +2623,7 @@ const TIMESHEET_PROMPT = [
 const TIMESHEET_GONE = "That timesheet is no longer open. Send the list again.";
 
 async function cmdTimesheet(chatId: number, session: Session): Promise<void> {
-  await saveSession(session, { state: "awaiting_timesheet" });
+  saveSessionSoon(session, { state: "awaiting_timesheet" });
   await send(chatId, TIMESHEET_PROMPT, { reply_markup: MAIN_KEYBOARD });
 }
 
@@ -2423,12 +2697,12 @@ async function startTimesheet(chatId: number, session: Session, text: string): P
   const sheet = parseTimesheet(text, await localDate(), await tz());
 
   if (sheet.entries.length === 0) {
-    await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
+    saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
     await send(chatId, "I couldn't find any worker lines in that.\n\n" + TIMESHEET_PROMPT);
     return;
   }
 
-  await saveSession(session, {
+  saveSessionSoon(session, {
     state: "idle",
     draft: { ...session.draft, timesheet: sheet, timesheet_raw: text.slice(0, 4000) },
   });
@@ -2443,12 +2717,12 @@ async function tsPatch(
 ): Promise<void> {
   const sheet = session.draft.timesheet;
   if (!sheet) {
-    await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
+    saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
     await send(chatId, TIMESHEET_GONE);
     return;
   }
   const next = { ...sheet, ...patch };
-  await saveSession(session, {
+  saveSessionSoon(session, {
     state: "idle",
     draft: { ...session.draft, timesheet: next },
   });
@@ -2561,7 +2835,7 @@ async function tsSave(
     throw entriesInsert.error;
   }
 
-  await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
+  saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
   await send(
     chatId,
     `✅ Timesheet saved · ${await fmtDate(workDate)} · Team ${sheet.teamNumber ?? "—"} · ${rows.length} entries`,
@@ -2606,20 +2880,20 @@ async function handleTimesheetCallback(
       if (messageId) await editKeyboard(chatId, messageId, []);
       return tsPatch(chatId, session, { workDate: await localDate(sub === "d1" ? 1 : 0) });
     case "dt":
-      await saveSession(session, { state: "ts_typing_date" });
+      saveSessionSoon(session, { state: "ts_typing_date" });
       await send(chatId, "Send the date as 2026-08-03 or 03/08/2026.");
       return;
     case "team":
-      await saveSession(session, { state: "ts_typing_team" });
+      saveSessionSoon(session, { state: "ts_typing_team" });
       await send(chatId, "Send the team, e.g. 3.");
       return;
     case "loc":
-      await saveSession(session, { state: "ts_typing_loc" });
+      saveSessionSoon(session, { state: "ts_typing_loc" });
       await send(chatId, "Send the location.");
       return;
     case "x":
       if (messageId) await editKeyboard(chatId, messageId, []);
-      await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
+      saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
       await send(chatId, "Discarded.");
       return;
     default:
@@ -2637,16 +2911,23 @@ async function handleCallbackQuery(query: TgCallbackQuery): Promise<void> {
     await answerCallback(query.id);
     return;
   }
-  if (chat && isGroupChat(chat)) return handleGroupCallback(query, chatId, messageId);
-  if (chat?.type && chat.type !== "private") {
+  const group = chat ? isGroupChat(chat) : false;
+  if (!group && chat?.type && chat.type !== "private") {
     await answerCallback(query.id);
     return;
   }
 
-  const [session, worker] = await Promise.all([getSession(chatId), findWorker(query.from.id)]);
+  // worker + session + open record in one round trip, same as for messages
+  const ctx = await loadBotContext(chatId, query.from.id);
+  // a group session belongs to nobody in particular — only the worker is used
+  if (group) return handleGroupCallback(query, chatId, messageId, ctx.worker);
 
+  const { session, worker } = ctx;
   if (!worker || worker.status !== "active") {
-    await answerCallback(query.id, worker ? "Your account isn't active." : "Please register first.");
+    await answerCallback(
+      query.id,
+      worker ? "Your account isn't active." : "Ask an admin to add your Telegram username.",
+    );
     return;
   }
   await answerCallback(query.id);
@@ -2655,9 +2936,14 @@ async function handleCallbackQuery(query: TgCallbackQuery): Promise<void> {
   const action = parts[0];
 
   // every r* action edits a report → ownership is checked before dispatch
-  const reportActions = ["rn", "rd", "rdd", "rdt", "rp", "rpp", "nskip"];
+  const reportActions = ["rn", "rd", "rdd", "rdt", "rp", "rpp", "nskip", "nfin"];
+  let report: Report | null = null;
   if (reportActions.includes(action)) {
-    const report = await ownedReport(Number(parts[1]), worker.id);
+    const reportId = Number(parts[1]);
+    // the open record came back with bot_context, already scoped to this worker
+    report = ctx.openReport?.id === reportId
+      ? ctx.openReport
+      : await ownedReport(reportId, worker.id);
     if (!report) {
       await send(chatId, NOT_YOURS);
       return;
@@ -2665,24 +2951,34 @@ async function handleCallbackQuery(query: TgCallbackQuery): Promise<void> {
   }
 
   switch (action) {
+    // nskip is the retired "Skip — no description" button; old cards still carry
+    // it, and skipping was only ever a way of saying the record was finished
     case "nskip":
-      return cbSkipDetails(chatId, messageId, session, worker, Number(parts[1]));
+    case "nfin":
+      return cbFinishRecord(chatId, messageId, session, worker, Number(parts[1]));
     case "ts":
       return handleTimesheetCallback(parts[1] ?? "", chatId, messageId, worker, session);
     case "pjm":
-      return cbPickProjectForMedia(chatId, messageId, worker, session, Number(parts[1]));
+      return cbPickProjectForMedia(
+        chatId,
+        messageId,
+        worker,
+        session,
+        ctx.openReport,
+        Number(parts[1]),
+      );
     case "rn":
-      return cbAskNote(chatId, worker, session, Number(parts[1]));
+      return cbAskNote(chatId, session, Number(parts[1]));
     case "rd":
       return cbShowDateOptions(chatId, messageId, Number(parts[1]));
     case "rdd":
-      return cbSetRelativeDate(chatId, messageId, Number(parts[1]), Number(parts[2]));
+      return cbSetRelativeDate(chatId, messageId, worker, session, report!, Number(parts[2]));
     case "rdt":
       return cbAskTypedDate(chatId, session, Number(parts[1]));
     case "rp":
       return cbShowProjectOptions(chatId, messageId, worker, Number(parts[1]));
     case "rpp":
-      return cbSetReportProject(chatId, messageId, Number(parts[1]), Number(parts[2]));
+      return cbSetReportProject(chatId, messageId, worker, session, report!, Number(parts[2]));
     default:
       console.error("unknown callback data", query.data);
   }
@@ -2693,6 +2989,7 @@ async function cbPickProjectForMedia(
   messageId: number | undefined,
   worker: Worker,
   session: Session,
+  previous: Report | null,
   projectId: number,
 ): Promise<void> {
   const project = await getProject(projectId);
@@ -2712,50 +3009,29 @@ async function cbPickProjectForMedia(
   // Text-only record: no files, the description IS the report. Attribution is
   // the report row itself — worker_id is set on insert, same as media reports.
   if (pending.length === 0 && session.draft.pending_note) {
-    const note = session.draft.pending_note; // saveSession mutates the draft
-    const { report } = await createReport(worker.id, projectId, note);
-    await saveSession(session, { state: "idle", draft: { report_id: report.id } });
-    const receipt = await receiptCard(
-      {
-        jobRef: report.job_ref ?? "—",
-        reportDate: report.report_date,
-        note: report.note,
-        code: project.code,
-        name: project.name,
-        mediaTypes: [],
-      },
-      await recordsToday(worker.id),
-    );
-    const markup = { inline_keyboard: reportButtons(report.id) };
-    if (messageId) {
-      await resolvePrompt(chatId, messageId, receipt, {
-        parse_mode: "HTML",
-        reply_markup: markup,
-      });
-    } else {
-      await send(chatId, receipt, { parse_mode: "HTML", reply_markup: markup });
-    }
+    const note = session.draft.pending_note; // the draft is rewritten below
+    const { report } = await createReport(worker.id, projectId, note, null, "open");
+    closePrevious(previous, report.id, worker.id);
+    // the site question becomes the open record's card, so we know its id
+    await showOpenRecord(chatId, messageId, worker, session, report.id, { queued: true });
     return;
   }
 
   if (pending.length === 0) {
     // stale tap — the batch was already saved or cancelled
-    await saveSession(session, { state: "idle", draft: resetDraft(session.draft) });
+    saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
     const line = "No files waiting — send them again and I'll ask for the site.";
     if (messageId) await resolvePrompt(chatId, messageId, line);
     else await send(chatId, line);
     return;
   }
 
-  if (messageId) {
-    await resolvePrompt(chatId, messageId, `📁 Filing to ${project.code} — ${project.name}`);
-  }
-
   const caption = pending.find((p) => p.caption)?.caption ?? null;
   const group = session.draft.pending_group ??
     pending.find((p) => p.media.media_group_id)?.media.media_group_id ?? null;
 
-  const { report, created } = await createReport(worker.id, projectId, caption, group);
+  const { report, created } = await createReport(worker.id, projectId, caption, group, "open");
+  if (created) closePrevious(previous, report.id, worker.id);
 
   // bounded parallelism: 3 at a time keeps a big album inside the wall clock
   const storedTypes: string[] = [];
@@ -2767,24 +3043,19 @@ async function cbPickProjectForMedia(
     });
   }
   const stored = storedTypes.length;
-  await supabase.from("pending_media").delete().eq("chat_id", chatId);
-
-  await saveSession(session, {
-    state: "idle",
-    draft: { report_id: report.id },
-  });
+  // the batch is filed; clearing the staging rows can overlap the reply
+  background(Promise.resolve(supabase.from("pending_media").delete().eq("chat_id", chatId)));
 
   if (stored === 0) {
     if (created) await supabase.from("reports").delete().eq("id", report.id);
+    saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
     await send(chatId, "⚠️ None of the files could be saved — please resend them.");
     return;
   }
+  // The site question turns into the record's own card — still open, and every
+  // later photo or note edits this one message rather than adding another.
   if (created) {
-    if (report.note !== null) {
-      await sendReportConfirmation(chatId, report, project, worker.id, storedTypes);
-    } else {
-      await askForDetails(chatId, session, report, project, worker, storedTypes);
-    }
+    await showOpenRecord(chatId, messageId, worker, session, report.id, { queued: true });
   }
   if (stored < pending.length) {
     await send(
@@ -2796,17 +3067,16 @@ async function cbPickProjectForMedia(
 
 async function cbAskNote(
   chatId: number,
-  worker: Worker,
   session: Session,
   reportId: number,
 ): Promise<void> {
-  await saveSession(session, {
+  saveSessionSoon(session, {
     state: "adding_note",
     draft: { ...session.draft, report_id: reportId },
   });
-  // Say plainly whether this adds to something, so nobody expects a replace.
-  const existing = await ownedReport(reportId, worker.id);
-  const prior = existing?.note?.trim();
+  // Say plainly that this adds a line, so nobody expects a replace. Only the
+  // last note is quoted — the earlier ones are already on the card above.
+  const prior = (await latestNote(reportId))?.trim();
   await send(
     chatId,
     prior
@@ -2837,6 +3107,24 @@ async function cbShowDateOptions(
  * "✅ Date set to…" line each time — after three tweaks the chat is all receipts
  * and the worker can no longer see what the report actually says.
  */
+/**
+ * Redraw whichever card the record currently is: an open one keeps its ✅ Done
+ * button, a finished one goes back to the saved receipt. Correcting the date on
+ * an open record must never quietly close it.
+ */
+function refreshRecordCard(
+  chatId: number,
+  messageId: number,
+  worker: Worker,
+  session: Session,
+  report: Report,
+): Promise<void> {
+  if (report.status === "open") {
+    return showOpenRecord(chatId, messageId, worker, session, report.id, { queued: true });
+  }
+  return refreshReportCard(chatId, messageId, report.id);
+}
+
 async function refreshReportCard(
   chatId: number,
   messageId: number | undefined,
@@ -2852,14 +3140,15 @@ async function refreshReportCard(
     ["Ref", c.jobRef],
     ["Site", siteLine(c)],
     ["Date", await fmtDateFull(c.reportDate)],
-    ["Description", c.note ? c.note : "—"],
   ];
+  if (c.notes.length === 0) rows.push(["Description", "—"]);
   if (c.mediaTypes.length > 0) rows.push(["Files", mediaLabel(c.mediaTypes)]);
 
+  const footer = c.name ? `\n${esc(`Saved to the ${c.name} archive.`)}` : "";
   await tg("editMessageText", {
     chat_id: chatId,
     message_id: messageId,
-    text: card("✅ Record saved", rows, c.name ? `Saved to the ${c.name} archive.` : undefined),
+    text: `${card("✅ Record saved", rows)}${await notesSection(c.notes)}${footer}`,
     parse_mode: "HTML",
     reply_markup: { inline_keyboard: reportButtons(reportId) },
   });
@@ -2868,18 +3157,23 @@ async function refreshReportCard(
 async function cbSetRelativeDate(
   chatId: number,
   messageId: number | undefined,
-  reportId: number,
+  worker: Worker,
+  session: Session,
+  report: Report,
   daysBack: number,
 ): Promise<void> {
   const date = await localDate(Number.isFinite(daysBack) ? daysBack : 0);
-  const { error } = await supabase.from("reports").update({ report_date: date }).eq("id", reportId);
+  const { error } = await supabase.from("reports").update({ report_date: date }).eq(
+    "id",
+    report.id,
+  );
   if (error) throw error;
-  if (messageId) await refreshReportCard(chatId, messageId, reportId);
+  if (messageId) await refreshRecordCard(chatId, messageId, worker, session, report);
   else await send(chatId, `✅ Date set to ${await fmtDate(date)}.`);
 }
 
 async function cbAskTypedDate(chatId: number, session: Session, reportId: number): Promise<void> {
-  await saveSession(session, {
+  saveSessionSoon(session, {
     state: "typing_date",
     draft: { ...session.draft, report_id: reportId },
   });
@@ -2904,7 +3198,9 @@ async function cbShowProjectOptions(
 async function cbSetReportProject(
   chatId: number,
   messageId: number | undefined,
-  reportId: number,
+  worker: Worker,
+  session: Session,
+  report: Report,
   projectId: number,
 ): Promise<void> {
   const project = await getProject(projectId);
@@ -2915,8 +3211,8 @@ async function cbSetReportProject(
   const { error } = await supabase
     .from("reports")
     .update({ project_id: projectId })
-    .eq("id", reportId);
+    .eq("id", report.id);
   if (error) throw error;
-  if (messageId) await refreshReportCard(chatId, messageId, reportId);
+  if (messageId) await refreshRecordCard(chatId, messageId, worker, session, report);
   else await send(chatId, `✅ Moved to ${project.code} — ${project.name}.`);
 }

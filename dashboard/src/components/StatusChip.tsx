@@ -6,11 +6,10 @@ interface Props {
   title?: string;
 }
 
-/** The one way status is rendered anywhere in the app: colored dot + label. */
+/** Status is communicated through the labeled chip itself, never an orphan dot. */
 export function StatusChip({ kind, label, title }: Props) {
   return (
     <span className={`status-chip ${kind}`} title={title}>
-      <span className="status-dot" aria-hidden="true" />
       {label}
     </span>
   );

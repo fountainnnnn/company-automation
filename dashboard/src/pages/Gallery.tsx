@@ -124,8 +124,9 @@ export function GalleryPage() {
     [mergeUrls],
   );
 
-  // A ten-photo album arrives as ten INSERTs on the same report. Collect the
-  // ids and refetch once per burst instead of once per row.
+  // A ten-photo album arrives as ten INSERTs on the same report, and a worker
+  // adds notes to an open record one at a time. Collect the report ids and
+  // refetch once per burst instead of once per row.
   const pendingMedia = useRef<Set<string>>(new Set());
   const flushTimer = useRef<number | null>(null);
 
@@ -163,16 +164,22 @@ export function GalleryPage() {
       .on(
         "postgres_changes",
         { event: "INSERT", schema: "public", table: "report_media" },
-        (payload) => {
-          const row = payload.new as { report_id: string };
-          if (!reportIds.current.has(row.report_id)) return;
-          pendingMedia.current.add(row.report_id);
-          if (flushTimer.current === null) {
-            flushTimer.current = window.setTimeout(flushMedia, 300);
-          }
-        },
+        (payload) => queueRefetch(payload.new as { report_id: string }),
+      )
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "report_notes" },
+        (payload) => queueRefetch(payload.new as { report_id: string }),
       )
       .subscribe();
+
+    function queueRefetch(row: { report_id: string }) {
+      if (!reportIds.current.has(row.report_id)) return;
+      pendingMedia.current.add(row.report_id);
+      if (flushTimer.current === null) {
+        flushTimer.current = window.setTimeout(flushMedia, 300);
+      }
+    }
 
     return () => {
       if (flushTimer.current !== null) {

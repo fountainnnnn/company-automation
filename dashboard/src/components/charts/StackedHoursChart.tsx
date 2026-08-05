@@ -48,12 +48,8 @@ export function StackedHoursChart({ data }: { data: OtDayRow[] }) {
   const innerH = HEIGHT - PAD.top - PAD.bottom;
   const n = buckets.length;
   const peak = Math.max(1, ...buckets.map((d) => d.normal_hours + d.ot_hours));
-  const rawTicks = niceTicks(peak);
-  const middleTick = Math.floor((rawTicks.length - 1) / 2);
-  const ticks = rawTicks.filter(
-    (_, index) => index === 0 || index === middleTick || index === rawTicks.length - 1,
-  );
-  const yMax = rawTicks[rawTicks.length - 1];
+  const ticks = niceTicks(peak);
+  const yMax = ticks[ticks.length - 1];
   const band = innerW / n;
   const colW = Math.max(12, Math.min(band * 0.42, 34));
   const cx = (i: number) => PAD.left + band * (i + 0.5);

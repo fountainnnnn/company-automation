@@ -1078,11 +1078,65 @@ input[type="checkbox"] {
 .report-head .spacer {
   flex: 1;
 }
-.report-note {
+/* One observation per line, each keeping the minute it was filed. */
+.report-notes {
   margin-top: var(--s-2);
-  color: var(--ink);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  list-style: none;
+  padding: 0;
+  min-width: 0;
+}
+.report-notes li {
+  display: flex;
+  gap: var(--s-2);
+  align-items: baseline;
+  min-width: 0;
   font-size: 0.9rem;
+}
+.report-notes time {
+  flex: none;
+  color: var(--ink-3);
+  font-size: 0.8rem;
+}
+.report-notes .note-body {
+  min-width: 0;
+  color: var(--ink);
   overflow-wrap: anywhere;
+}
+.report-notes .note-by {
+  color: var(--ink-2);
+}
+
+/* Admin: one row per entry, editable or removable on its own. */
+.note-editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  list-style: none;
+  padding: 0;
+  min-width: 0;
+}
+.note-editor li {
+  display: flex;
+  gap: var(--s-2);
+  align-items: flex-start;
+  min-width: 0;
+}
+.note-editor li > span {
+  flex: none;
+  padding-top: 10px;
+  color: var(--ink-2);
+  font-size: 0.8rem;
+}
+.note-editor textarea {
+  flex: 1;
+  min-width: 0;
+}
+.note-editor li.gone textarea {
+  opacity: 0.45;
+  text-decoration: line-through;
 }
 .thumbs {
   display: grid;

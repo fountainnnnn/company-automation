@@ -1,11 +1,12 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Button } from "./Button";
 import { ConfirmDialog, Modal } from "./Modal";
 import { Lightbox } from "./Lightbox";
 import type { LightboxItem } from "./Lightbox";
+import { StatusChip } from "./StatusChip";
 import { useToast } from "./Toast";
 import { MEDIA_BUCKET, supabase } from "../lib/supabase";
-import { mediaLabel, REPORT_SELECT } from "../lib/reports";
+import { mediaLabel, REPORT_SELECT, reportEntries } from "../lib/reports";
 import { formatFileSize, formatTime } from "../lib/format";
 import type { Report, ReportMedia } from "../lib/types";
 
@@ -35,14 +36,23 @@ export function ReportCard({
   const [editing, setEditing] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [note, setNote] = useState(report.note ?? "");
   const [date, setDate] = useState(report.report_date);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [removed, setRemoved] = useState<string[]>([]);
+  const [added, setAdded] = useState("");
+
+  const entries = useMemo(() => reportEntries(report), [report]);
+  // Only real `report_notes` rows are editable; the flat-mirror fallback is not
+  // a row anyone can address.
+  const notes = report.report_notes ?? [];
 
   // Seed the form from the report as it stands right now, so an edit never
   // starts from values a realtime update or a cancelled edit left behind.
   function openEditor() {
-    setNote(report.note ?? "");
     setDate(report.report_date);
+    setDrafts(Object.fromEntries(notes.map((n) => [n.id, n.body])));
+    setRemoved([]);
+    setAdded("");
     setEditing(true);
   }
 
@@ -53,22 +63,60 @@ export function ReportCard({
     alt,
   }));
 
+  /**
+   * Notes are edited one entry at a time on `report_notes`. `reports.note` is a
+   * trigger-maintained mirror, so writing it here would only be overwritten.
+   */
   async function save() {
     setBusy(true);
+
+    if (removed.length > 0) {
+      const { error } = await supabase.from("report_notes").delete().in("id", removed);
+      if (error) return fail(error.message);
+    }
+
+    for (const n of notes) {
+      if (removed.includes(n.id)) continue;
+      const body = (drafts[n.id] ?? n.body).trim();
+      if (body === n.body) continue;
+      if (!body) return fail("A note cannot be emptied — delete it instead.");
+      const { error } = await supabase.from("report_notes").update({ body }).eq("id", n.id);
+      if (error) return fail(error.message);
+    }
+
+    if (added.trim()) {
+      const { error } = await supabase
+        .from("report_notes")
+        .insert({ report_id: report.id, worker_id: null, body: added.trim() });
+      if (error) return fail(error.message);
+    }
+
+    if (date !== report.report_date) {
+      const { error } = await supabase
+        .from("reports")
+        .update({ report_date: date })
+        .eq("id", report.id);
+      if (error) return fail(error.message);
+    }
+
     const { data, error } = await supabase
       .from("reports")
-      .update({ note: note.trim() || null, report_date: date })
-      .eq("id", report.id)
       .select(REPORT_SELECT)
+      .eq("id", report.id)
       .single();
     setBusy(false);
     if (error || !data) {
-      toast.error(error?.message ?? "Could not save the report.");
+      toast.error(error?.message ?? "Saved, but the report could not be reloaded.");
       return;
     }
     toast.success("Report updated.");
     setEditing(false);
-    onChanged(data as Report);
+    onChanged(data as unknown as Report);
+  }
+
+  function fail(message: string) {
+    setBusy(false);
+    toast.error(message);
   }
 
   async function remove() {
@@ -105,6 +153,13 @@ export function ReportCard({
           {report.workers?.full_name ?? "Unknown worker"}
         </span>
         <span className="chip tnum">{formatTime(report.created_at)}</span>
+        {report.status === "open" && (
+          <StatusChip
+            kind="info"
+            label="still adding"
+            title="The worker is still adding to this record from Telegram."
+          />
+        )}
         {showProject && report.projects && (
           <span className="chip code" title={report.projects.name}>
             {report.projects.code}
@@ -124,7 +179,21 @@ export function ReportCard({
         )}
       </div>
 
-      {report.note && <p className="report-note">{report.note}</p>}
+      {entries.length > 0 && (
+        <ul className="report-notes">
+          {entries.map((e) => (
+            <li key={e.key}>
+              <time className="tnum" dateTime={e.at}>
+                {formatTime(e.at)}
+              </time>
+              <span className="note-body">
+                {e.body}
+                {e.author && <span className="note-by"> — {e.author}</span>}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
 
       {media.length > 0 && (
         <div className="thumbs">
@@ -190,13 +259,49 @@ export function ReportCard({
               onChange={(e) => setDate(e.target.value)}
             />
           </div>
+          {notes.length > 0 && (
+            <div className="field">
+              <label>Entries</label>
+              <ul className="note-editor">
+                {notes.map((n) => {
+                  const gone = removed.includes(n.id);
+                  return (
+                    <li key={n.id} className={gone ? "gone" : undefined}>
+                      <span className="tnum">{formatTime(n.created_at)}</span>
+                      <textarea
+                        className="input"
+                        aria-label={`Note at ${formatTime(n.created_at)}`}
+                        rows={2}
+                        disabled={gone}
+                        value={drafts[n.id] ?? n.body}
+                        onChange={(e) =>
+                          setDrafts((prev) => ({ ...prev, [n.id]: e.target.value }))
+                        }
+                      />
+                      <Button
+                        variant="ghost"
+                        onClick={() =>
+                          setRemoved((prev) =>
+                            gone ? prev.filter((id) => id !== n.id) : [...prev, n.id],
+                          )
+                        }
+                      >
+                        {gone ? "Undo" : "Delete"}
+                      </Button>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          )}
           <div className="field">
-            <label htmlFor={`note-${report.id}`}>Note</label>
+            <label htmlFor={`note-${report.id}`}>Add note</label>
             <textarea
               id={`note-${report.id}`}
               className="input"
-              value={note}
-              onChange={(e) => setNote(e.target.value)}
+              placeholder="Appended as a new entry, timestamped now."
+              value={added}
+              onChange={(e) => setAdded(e.target.value)}
             />
           </div>
         </Modal>

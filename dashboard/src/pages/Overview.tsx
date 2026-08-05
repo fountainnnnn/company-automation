@@ -3,10 +3,13 @@ import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
 import {
   ArrowUpRight,
+  Camera,
   Check,
   Clock3,
-  FileImage,
+  FileText,
+  MessageSquareText,
   RefreshCw,
+  Video,
 } from "lucide-react";
 import { EmptyState } from "../components/EmptyState";
 import { SectionHeader } from "../components/SectionHeader";
@@ -33,8 +36,10 @@ import type {
   OverviewStats,
   Project,
   ProjectCostRow,
+  PayrollRow,
   Report,
   TeamHoursRow,
+  TimesheetStats,
 } from "../lib/types";
 
 const RANGES = [7, 30, 90];
@@ -66,6 +71,8 @@ interface OverviewData {
   teams: TeamHoursRow[];
   costs: ProjectCostRow[];
   otDays: OtDayRow[];
+  timesheetExceptions: number;
+  payrollExceptions: number;
   range: number;
 }
 
@@ -112,6 +119,8 @@ export function OverviewPage() {
         teamsResult,
         costResult,
         otResult,
+        timesheetResult,
+        payrollResult,
       ] = await Promise.all([
         supabase.rpc("overview_stats"),
         supabase.rpc("reports_by_day", { days: range }),
@@ -130,6 +139,11 @@ export function OverviewPage() {
         // back empty there and their sections are simply not rendered.
         supabase.rpc("cost_by_project", { days: range }),
         supabase.rpc("ot_by_day", { days: range }),
+        supabase.rpc("timesheet_stats", { days: range }),
+        supabase.rpc("payroll_summary", {
+          from_date: toSgtDay(new Date(Date.now() - (range - 1) * 86_400_000)),
+          to_date: toSgtDay(new Date()),
+        }),
       ]);
 
       if (!active) return;
@@ -141,12 +155,16 @@ export function OverviewPage() {
         teamsResult,
         costResult,
         otResult,
+        timesheetResult,
+        payrollResult,
       ].find((result) => result.error);
       if (failed?.error) toast.error(failed.error.message);
 
       const reports = (reportsResult.data ?? []) as unknown as Report[];
       const signedUrls = await signReportMedia(reports);
       if (!active) return;
+      const timesheetStats = (timesheetResult.data as TimesheetStats[] | null)?.[0];
+      const payrollRows = (payrollResult.data ?? []) as PayrollRow[];
 
       setData({
         stats: normaliseStats((statsResult.data as OverviewStats[] | null)?.[0]),
@@ -176,6 +194,12 @@ export function OverviewPage() {
           normal_hours: Number(row.normal_hours),
           ot_hours: Number(row.ot_hours),
         })),
+        timesheetExceptions: Number(timesheetStats?.unresolved ?? 0),
+        payrollExceptions: payrollRows.reduce(
+          (total, row) =>
+            total + (row.hourly_rate === null ? 1 : 0) + Number(row.missing_checkout ?? 0),
+          0,
+        ),
         range,
       });
     })();
@@ -397,7 +421,6 @@ function CommandBoard({ data, isAdmin }: { data: OverviewData; isAdmin: boolean 
       <section className="command-map glass-panel" aria-labelledby="live-sites-title">
         <div className="command-panel-head map-head">
           <div>
-            <span className="live-dot" aria-hidden="true" />
             <h3 id="live-sites-title">Live sites</h3>
           </div>
           <span>{mapped} mapped of {data.projects.length} active</span>
@@ -405,7 +428,12 @@ function CommandBoard({ data, isAdmin }: { data: OverviewData; isAdmin: boolean 
         <SiteMap points={mapPoints} height={330} className="overview-site-map" />
       </section>
 
-      <ReviewQueue stats={stats} isAdmin={isAdmin} />
+      <ReviewQueue
+        stats={stats}
+        timesheetExceptions={data.timesheetExceptions}
+        payrollExceptions={data.payrollExceptions}
+        isAdmin={isAdmin}
+      />
 
       <section className="command-sites glass-panel" aria-labelledby="latest-sites-title">
         <div className="command-panel-head">
@@ -449,14 +477,24 @@ function CommandBoard({ data, isAdmin }: { data: OverviewData; isAdmin: boolean 
           <ol className="command-timeline">
             {data.reports.slice(0, 5).map((report) => (
               <li key={report.id}>
-                <span className="timeline-icon"><FileImage size={15} aria-hidden="true" /></span>
-                <time dateTime={report.created_at}>{formatTime(report.created_at)}</time>
-                <div>
+                <time dateTime={report.created_at}>
+                  <span>{formatDayShort(toSgtDay(new Date(report.created_at)))}</span>
+                  <strong>{formatTime(report.created_at)}</strong>
+                </time>
+                <div className="timeline-copy">
                   <Link to={`/projects/${report.project_id}`}>
-                    {report.projects?.code || "Site"} report submitted
+                    <strong>{report.projects?.code || "Site"}</strong>
+                    <span> report submitted</span>
                   </Link>
-                  <span>{report.workers?.full_name || "Telegram submission"} · {formatRelative(report.created_at)}</span>
+                  <span>
+                    {report.workers?.full_name || "Telegram submission"}
+                    <i aria-hidden="true">·</i>
+                    {formatRelative(report.created_at)}
+                  </span>
                 </div>
+                <span className="timeline-type-icon" aria-hidden="true">
+                  {reportActivityIcon(report)}
+                </span>
               </li>
             ))}
           </ol>
@@ -497,19 +535,39 @@ function plural(count: number, one: string): string {
   return `${count} ${count === 1 ? one : `${one}s`}`;
 }
 
-function ReviewQueue({ stats, isAdmin }: { stats: OverviewStats; isAdmin: boolean }) {
-  const clear = stats.open_flags === 0 && stats.pending_workers === 0;
+function reportActivityIcon(report: Report): ReactNode {
+  const mediaTypes = report.report_media?.map((item) => item.media_type) ?? [];
+  if (mediaTypes.includes("photo")) return <Camera size={15} strokeWidth={1.8} />;
+  if (mediaTypes.includes("video")) return <Video size={15} strokeWidth={1.8} />;
+  if (mediaTypes.includes("document")) return <FileText size={15} strokeWidth={1.8} />;
+  return <MessageSquareText size={15} strokeWidth={1.8} />;
+}
+
+function ReviewQueue({
+  stats,
+  timesheetExceptions,
+  payrollExceptions,
+  isAdmin,
+}: {
+  stats: OverviewStats;
+  timesheetExceptions: number;
+  payrollExceptions: number;
+  isAdmin: boolean;
+}) {
+  const clear =
+    stats.open_flags === 0 &&
+    timesheetExceptions === 0 &&
+    (!isAdmin || payrollExceptions === 0);
   return (
     <section className="command-review glass-panel" aria-labelledby="review-title">
       <div className="command-panel-head">
         <h3 id="review-title">Needs review</h3>
-        {isAdmin && <Link to="/attendance">View all</Link>}
       </div>
       {clear ? (
         <div className="review-clear">
           <span><Check size={19} aria-hidden="true" /></span>
           <strong>Queue clear</strong>
-          <p>No attendance flags or worker approvals are waiting.</p>
+          <p>No attendance, timesheet, or payroll issues are waiting.</p>
         </div>
       ) : (
         <div className="review-list">
@@ -523,14 +581,24 @@ function ReviewQueue({ stats, isAdmin }: { stats: OverviewStats; isAdmin: boolea
               to={isAdmin ? "/attendance" : undefined}
             />
           )}
-          {stats.pending_workers > 0 && (
+          {timesheetExceptions > 0 && (
             <ReviewItem
-              iconSrc="/ui-icons/worker-approval-transparent.png"
-              category="Workforce access"
-              count={stats.pending_workers}
-              label="pending workers"
-              detail="Telegram registrations"
-              to={isAdmin ? "/workers" : undefined}
+              iconSrc="/ui-icons/timesheet-exception.svg"
+              category="Timesheet control"
+              count={timesheetExceptions}
+              label={timesheetExceptions === 1 ? "unresolved entry" : "unresolved entries"}
+              detail="Worker IDs need matching"
+              to="/timesheets"
+            />
+          )}
+          {isAdmin && payrollExceptions > 0 && (
+            <ReviewItem
+              iconSrc="/ui-icons/payroll-readiness.svg"
+              category="Payroll readiness"
+              count={payrollExceptions}
+              label={payrollExceptions === 1 ? "payroll issue" : "payroll issues"}
+              detail="Missing rates or checkout times"
+              to="/payroll"
             />
           )}
         </div>

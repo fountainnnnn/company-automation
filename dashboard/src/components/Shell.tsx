@@ -31,8 +31,7 @@ interface NavItem {
   label: string;
   icon: LucideIcon;
   end: boolean;
-  /** "flags" and "pending" carry a live count pill when there is one. */
-  badge?: "flags" | "pending";
+  badge?: "flags";
 }
 
 interface NavGroup {
@@ -57,7 +56,7 @@ const GROUPS: NavGroup[] = [
     adminOnly: true,
     items: [
       { to: "/attendance", label: "Attendance", icon: MapPin, end: false, badge: "flags" },
-      { to: "/workers", label: "Workers", icon: Users, end: false, badge: "pending" },
+      { to: "/workers", label: "Workers", icon: Users, end: false },
       { to: "/payroll", label: "Payroll", icon: Wallet, end: false },
       { to: "/projects-admin", label: "Manage", icon: Settings2, end: false },
     ],
@@ -99,10 +98,7 @@ export function Shell() {
   const panelRef = useRef<HTMLElement>(null);
   const [drawer, setDrawer] = useState(false);
   const [pageTitle, setPageTitle] = useState<PageTitleState | null>(null);
-  const [counts, setCounts] = useState<{ flags: number; pending: number }>({
-    flags: 0,
-    pending: 0,
-  });
+  const [openFlags, setOpenFlags] = useState(0);
   const [term, setTerm] = useState("");
 
   const open = compact && drawer;
@@ -119,7 +115,7 @@ export function Shell() {
   }).format(new Date());
   const groups = useMemo(() => GROUPS.filter((g) => isAdmin || !g.adminOnly), [isAdmin]);
 
-  // One aggregate call feeds both sidebar count pills; staff never see the rows.
+  // Attendance flags are the only review count shown in navigation.
   useEffect(() => {
     if (!isAdmin) return;
     let active = true;
@@ -127,7 +123,7 @@ export function Shell() {
       const { data } = await supabase.rpc("overview_stats");
       const row = (data as OverviewStats[] | null)?.[0];
       if (!active || !row) return;
-      setCounts({ flags: Number(row.open_flags), pending: Number(row.pending_workers) });
+      setOpenFlags(Number(row.open_flags));
     })();
     return () => {
       active = false;
@@ -151,9 +147,7 @@ export function Shell() {
   }, [open]);
 
   function badgeFor(item: NavItem): number {
-    if (item.badge === "flags") return counts.flags;
-    if (item.badge === "pending") return counts.pending;
-    return 0;
+    return item.badge === "flags" ? openFlags : 0;
   }
 
   return (
@@ -170,6 +164,7 @@ export function Shell() {
           ref={panelRef}
           {...(open ? { role: "dialog" as const, "aria-modal": true, "aria-label": "Navigation" } : {})}
         >
+          <div className="sidebar-inner">
           <div className="side-brand">
             <span className="side-mark" aria-hidden="true">
               CL
@@ -194,12 +189,8 @@ export function Shell() {
                         <span className="truncate">{l.label}</span>
                         {count > 0 && (
                           <span
-                            className={`side-badge${l.badge === "pending" ? " warn" : ""}`}
-                            title={
-                              l.badge === "pending"
-                                ? `${count} pending registrations`
-                                : `${count} open flags`
-                            }
+                            className="side-badge"
+                            title={`${count} open flags`}
                           >
                             {count}
                           </span>
@@ -222,7 +213,7 @@ export function Shell() {
               </span>
               <span>
                 <strong>Telegram</strong>
-                <small>Connected <i aria-hidden="true" /></small>
+                <small>Connected</small>
               </span>
             </div>
           </div>
@@ -251,6 +242,7 @@ export function Shell() {
               <span className="role">{profile?.role ?? "staff"}</span>
             </span>
           </div>
+          </div>
         </aside>
 
         <div className="app-main">
@@ -268,8 +260,10 @@ export function Shell() {
             )}
 
             <div className="topbar-context">
-              <span className="sync-state"><i aria-hidden="true" /> Live sync</span>
-              <span className="topbar-date"><CalendarDays size={16} strokeWidth={1.7} aria-hidden="true" /> {today}</span>
+              <span className="topbar-date">
+                Today is <strong>{today}</strong>
+                <CalendarDays size={16} strokeWidth={1.7} aria-hidden="true" />
+              </span>
             </div>
             <h1 className="topbar-title truncate" title={title}>{title}</h1>
 
@@ -301,13 +295,13 @@ export function Shell() {
                   to="/attendance"
                   className="icon-btn round"
                   aria-label={
-                    counts.flags > 0
-                      ? `Attendance flags — ${counts.flags} open`
+                    openFlags > 0
+                      ? `Attendance flags — ${openFlags} open`
                       : "Attendance flags"
                   }
                   title={
-                    counts.flags > 0
-                      ? `${counts.flags} attendance flags open`
+                    openFlags > 0
+                      ? `${openFlags} attendance flags open`
                       : "No attendance flags open"
                   }
                 >

@@ -61,17 +61,37 @@ export interface ReportMedia {
   created_at: string;
 }
 
+/** One thing a worker said, at the time they said it. The unit of a report's story. */
+export interface ReportNote {
+  id: string;
+  report_id: string;
+  worker_id: string | null;
+  body: string;
+  created_at: string;
+  workers: { full_name: string } | null;
+}
+
+/** A record is `open` while the worker is still adding to it from Telegram. */
+export type ReportStatus = "open" | "final";
+
 export interface Report {
   id: string;
   project_id: string;
   worker_id: string | null;
   report_date: string;
+  /**
+   * Trigger-maintained newline-joined mirror of `report_notes`. Read it for
+   * search and filtering only — never render it, never write to it.
+   */
   note: string | null;
+  status: ReportStatus;
+  closed_at: string | null;
   created_at: string;
   updated_at: string | null;
   workers: { full_name: string } | null;
   projects: { code: string; name: string } | null;
   report_media: ReportMedia[];
+  report_notes?: ReportNote[];
 }
 
 export interface Attendance {

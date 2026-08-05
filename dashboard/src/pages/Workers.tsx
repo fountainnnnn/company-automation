@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
 import { supabase } from "../lib/supabase";
-import { formatDay, toSgtDay } from "../lib/format";
 import type { Project, ProjectWorker, TimesheetRole, Worker } from "../lib/types";
 import { SectionHeader } from "../components/SectionHeader";
 import { Button } from "../components/Button";
@@ -40,12 +39,16 @@ export function WorkersPage() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [links, setLinks] = useState<ProjectWorker[]>([]);
   const [assign, setAssign] = useState<AssignState | null>(null);
-  const [disabling, setDisabling] = useState<{ worker: Worker; reject: boolean } | null>(null);
+  const [disabling, setDisabling] = useState<Worker | null>(null);
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
     const [wk, pj, pw] = await Promise.all([
-      supabase.from("workers").select("*").order("created_at", { ascending: false }),
+      supabase
+        .from("workers")
+        .select("*")
+        .neq("status", "pending")
+        .order("created_at", { ascending: false }),
       supabase.from("projects").select("*").eq("status", "active").order("code"),
       supabase.from("project_workers").select("project_id,worker_id"),
     ]);
@@ -82,6 +85,26 @@ export function WorkersPage() {
     return true;
   }
 
+  async function setPrimaryProject(worker: Worker, projectId: string) {
+    const nextId = projectId || null;
+    if (nextId && !links.some((link) => link.worker_id === worker.id && link.project_id === nextId)) {
+      const { error } = await supabase
+        .from("project_workers")
+        .insert({ project_id: nextId, worker_id: worker.id });
+      if (error && error.code !== "23505") {
+        toast.error(error.message);
+        return;
+      }
+      setLinks((prev) => [...prev, { project_id: nextId, worker_id: worker.id }]);
+    }
+
+    await patchWorker(
+      worker.id,
+      { default_project_id: nextId },
+      nextId ? "Primary project updated." : "Primary project cleared.",
+    );
+  }
+
   async function saveAssignment() {
     if (!assign) return;
     setBusy(true);
@@ -112,12 +135,7 @@ export function WorkersPage() {
         return;
       }
     }
-    // Approving a pending registration activates it; editing an existing
-    // worker must never silently re-enable someone who was disabled.
-    const patch: Partial<Worker> =
-      worker.status === "pending"
-        ? { status: "active", default_project_id: defaultId || null }
-        : { default_project_id: defaultId || null };
+    const patch: Partial<Worker> = { default_project_id: defaultId || null };
     const { error: upErr } = await supabase
       .from("workers")
       .update(patch)
@@ -136,84 +154,42 @@ export function WorkersPage() {
     ]);
     setWorkers((prev) => (prev ?? []).map((w) => (w.id === worker.id ? { ...w, ...patch } : w)));
     setAssign(null);
-    toast.success(
-      worker.status === "pending"
-        ? `${worker.full_name} approved.`
-        : `Projects updated for ${worker.full_name}.`,
-    );
+    toast.success(`Projects updated for ${worker.full_name}.`);
   }
 
-  const pending = (workers ?? []).filter((w) => w.status === "pending");
-  const rest = (workers ?? []).filter((w) => w.status !== "pending");
+  const rest = workers ?? [];
 
   return (
     <div className="reveal">
       <SectionHeader
         title="Workers"
-        subtitle={
-          workers === null
-            ? undefined
-            : `${pending.length} pending · ${rest.length} approved`
-        }
+        subtitle={workers === null ? undefined : `${rest.length} workers`}
       />
-
-      <h2 className="sub-head">Pending registrations</h2>
-      {workers === null ? (
-        <SkeletonList rows={2} />
-      ) : pending.length === 0 ? (
-        <EmptyState
-          title="No one waiting"
-          hint="New Telegram sign-ups land here the moment a worker sends their name to the bot."
-        />
-      ) : (
-        <div className="stack">
-          {pending.map((w) => (
-            <div key={w.id} className="panel panel-p row">
-              <div style={{ minWidth: 0, flex: 1 }}>
-                <p className="truncate" style={{ fontWeight: 500 }} title={w.full_name}>
-                  {w.full_name}
-                </p>
-                <p className="muted" style={{ fontSize: "0.85rem" }}>
-                  {w.telegram_username ? `@${w.telegram_username}` : "no username"} · registered{" "}
-                  {formatDay(toSgtDay(w.created_at))}
-                </p>
-              </div>
-              <div className="row row-end">
-                <Button
-                  variant="primary"
-                  onClick={() =>
-                    setAssign({
-                      worker: w,
-                      projectIds: projectsOf(w.id).map((p) => p.id),
-                      defaultId: w.default_project_id ?? "",
-                    })
-                  }
-                >
-                  Approve
-                </Button>
-                <Button
-                  variant="danger"
-                  onClick={() => setDisabling({ worker: w, reject: true })}
-                >
-                  Reject
-                </Button>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
 
       <h2 className="sub-head">All workers</h2>
       {workers === null ? (
         <SkeletonList rows={2} />
       ) : rest.length === 0 ? (
         <EmptyState
-          title="No approved workers yet"
-          hint="Approve a pending registration and the worker shows up here."
+          title="No workers yet"
+          hint="Workers appear here after an admin adds their details."
         />
       ) : (
         <div className="table-wrap">
-          <table className="data">
+          <table className="data workers-table">
+            <colgroup>
+              <col className="worker-col-name" />
+              <col className="worker-col-code" />
+              <col className="worker-col-role" />
+              <col className="worker-col-team" />
+              <col className="worker-col-rate" />
+              <col className="worker-col-hours" />
+              <col className="worker-col-ot" />
+              <col className="worker-col-telegram" />
+              <col className="worker-col-project" />
+              <col className="worker-col-status" />
+              <col className="worker-col-actions" />
+            </colgroup>
             <thead>
               <tr>
                 <th>Name</th>
@@ -224,8 +200,7 @@ export function WorkersPage() {
                 <th className="num">Expected h/day</th>
                 <th className="num">OT ×</th>
                 <th>Telegram</th>
-                <th>Projects</th>
-                <th>Default</th>
+                <th>Project</th>
                 <th>Status</th>
                 <th />
               </tr>
@@ -233,10 +208,9 @@ export function WorkersPage() {
             <tbody>
               {rest.map((w) => {
                 const assigned = projectsOf(w.id);
-                const def = projects.find((p) => p.id === w.default_project_id);
                 return (
                   <tr key={w.id}>
-                    <td style={{ minWidth: 160 }}>
+                    <td>
                       <label className="sr-only" htmlFor={`wn-${w.id}`}>
                         Full name
                       </label>
@@ -252,7 +226,7 @@ export function WorkersPage() {
                         }}
                       />
                     </td>
-                    <td style={{ minWidth: 110 }}>
+                    <td>
                       <label className="sr-only" htmlFor={`wc-${w.id}`}>
                         Worker ID for {w.full_name}
                       </label>
@@ -277,7 +251,7 @@ export function WorkersPage() {
                         }}
                       />
                     </td>
-                    <td style={{ minWidth: 120 }}>
+                    <td>
                       <label className="sr-only" htmlFor={`wr-${w.id}`}>
                         Role for {w.full_name}
                       </label>
@@ -300,7 +274,7 @@ export function WorkersPage() {
                         ))}
                       </select>
                     </td>
-                    <td style={{ minWidth: 84 }}>
+                    <td>
                       <label className="sr-only" htmlFor={`wt-${w.id}`}>
                         Team for {w.full_name}
                       </label>
@@ -321,7 +295,7 @@ export function WorkersPage() {
                         }}
                       />
                     </td>
-                    <td style={{ minWidth: 128 }}>
+                    <td>
                       <label className="sr-only" htmlFor={`wrate-${w.id}`}>
                         Hourly rate for {w.full_name}
                       </label>
@@ -368,7 +342,7 @@ export function WorkersPage() {
                         )}
                       </div>
                     </td>
-                    <td style={{ minWidth: 96 }}>
+                    <td>
                       <label className="sr-only" htmlFor={`wexp-${w.id}`}>
                         Expected hours per day for {w.full_name}
                       </label>
@@ -400,7 +374,7 @@ export function WorkersPage() {
                         }}
                       />
                     </td>
-                    <td style={{ minWidth: 84 }}>
+                    <td>
                       <label className="sr-only" htmlFor={`wot-${w.id}`}>
                         Overtime multiplier for {w.full_name}
                       </label>
@@ -436,19 +410,23 @@ export function WorkersPage() {
                       {w.telegram_username ? `@${w.telegram_username}` : "—"}
                     </td>
                     <td>
-                      <div className="row">
-                        {assigned.length === 0 ? (
-                          <span className="muted">none</span>
-                        ) : (
-                          assigned.map((p) => (
-                            <span key={p.id} className="chip code" title={p.name}>
-                              {p.code}
-                            </span>
-                          ))
-                        )}
-                      </div>
+                      <label className="sr-only" htmlFor={`wp-${w.id}`}>
+                        Primary project for {w.full_name}
+                      </label>
+                      <select
+                        id={`wp-${w.id}`}
+                        className="select select-sm worker-project-select"
+                        value={w.default_project_id ?? ""}
+                        onChange={(event) => void setPrimaryProject(w, event.target.value)}
+                      >
+                        <option value="">Unassigned</option>
+                        {projects.map((project) => (
+                          <option key={project.id} value={project.id}>
+                            {project.code} — {project.name}
+                          </option>
+                        ))}
+                      </select>
                     </td>
-                    <td>{def ? def.code : "—"}</td>
                     <td>
                       <StatusChip
                         kind={w.status === "active" ? "ok" : w.status === "pending" ? "warn" : "neutral"}
@@ -472,7 +450,7 @@ export function WorkersPage() {
                         {w.status === "active" ? (
                           <Button
                             variant="danger"
-                            onClick={() => setDisabling({ worker: w, reject: false })}
+                            onClick={() => setDisabling(w)}
                           >
                             Disable
                           </Button>
@@ -498,21 +476,16 @@ export function WorkersPage() {
 
       {disabling && (
         <ConfirmDialog
-          title={disabling.reject ? "Reject this registration?" : "Disable this worker?"}
-          message={
-            disabling.reject
-              ? `${disabling.worker.full_name} will not be able to send from Telegram. You can enable them later from the workers table.`
-              : `${disabling.worker.full_name} will stop being able to send reports or check in. Their past records stay intact.`
-          }
-          confirmLabel={disabling.reject ? "Reject" : "Disable worker"}
+          title="Disable this worker?"
+          message={`${disabling.full_name} will stop being able to send reports or check in. Their past records stay intact.`}
+          confirmLabel="Disable worker"
           busy={busy}
           onConfirm={() => {
-            const { worker, reject } = disabling;
             setBusy(true);
             void patchWorker(
-              worker.id,
+              disabling.id,
               { status: "disabled" },
-              reject ? `${worker.full_name} rejected.` : "Worker disabled.",
+              "Worker disabled.",
             ).finally(() => {
               setBusy(false);
               setDisabling(null);

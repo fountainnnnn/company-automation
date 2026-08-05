@@ -13,7 +13,41 @@ export function mediaLabel(m: ReportMedia): string {
 }
 
 export const PAGE_SIZE = 30;
-export const REPORT_SELECT = "*,workers(full_name),projects(code,name),report_media(*)";
+export const REPORT_SELECT =
+  "*,workers(full_name),projects(code,name),report_media(*)," +
+  "report_notes(id,report_id,worker_id,body,created_at,workers(full_name))";
+
+/** One line of a report's description: when it was said, and by whom if not the filer. */
+export interface ReportEntry {
+  key: string;
+  at: string;
+  body: string;
+  /** Set only when the note's author differs from the report's worker. */
+  author: string | null;
+}
+
+/**
+ * The report's description as separate timestamped entries, oldest first.
+ * Rows filed before `report_notes` existed only have the flat mirror, so that
+ * is shown as a single entry rather than disappearing.
+ */
+export function reportEntries(report: Report): ReportEntry[] {
+  const notes = report.report_notes ?? [];
+  if (notes.length > 0) {
+    return [...notes]
+      .sort((a, b) => (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0))
+      .map((n) => ({
+        key: n.id,
+        at: n.created_at,
+        body: n.body,
+        author:
+          n.worker_id && n.worker_id !== report.worker_id ? (n.workers?.full_name ?? null) : null,
+      }));
+  }
+  const flat = report.note?.trim();
+  if (!flat) return [];
+  return [{ key: `flat-${report.id}`, at: report.created_at, body: flat, author: null }];
+}
 
 export interface ReportPage {
   rows: Report[];
