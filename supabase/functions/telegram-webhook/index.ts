@@ -212,6 +212,14 @@ interface Draft {
   report_id?: number;
   /** The open record's card, so every addition edits it instead of stacking a new one. */
   card_message_id?: number;
+  /**
+   * The card is currently showing the review step. Edits reached from there
+   * (note, date, site) return to the review rather than the open card — the
+   * worker was on their way out, so don't drop them back a step.
+   */
+  review?: boolean;
+  /** The note being rewritten, while the state is `editing_note`. */
+  note_id?: number;
   pending_group?: string | null;
   /** Text-only record waiting for its site pick. */
   pending_note?: string;
@@ -226,6 +234,7 @@ type SessionState =
   | "awaiting_checkout_location"
   | "choosing_project_for_media"
   | "adding_note"
+  | "editing_note"
   | "typing_date"
   | "awaiting_record"
   | "awaiting_timesheet"
@@ -467,10 +476,26 @@ function replyTo(
 }
 
 const LOCATION_KEYBOARD = {
-  keyboard: [[{ text: "📍 Share location", request_location: true }]],
+  keyboard: [
+    [{ text: "📍 Share location", request_location: true }],
+    // A reply keyboard can't carry an inline ❌, and a question with no visible
+    // way out is how people got stuck here — so cancelling gets its own key.
+    [{ text: "❌ Cancel" }],
+  ],
   one_time_keyboard: true,
   resize_keyboard: true,
 };
+
+/**
+ * The escape hatch every prompt carries. /cancel existed all along but nothing
+ * on screen ever said so, which made a mistyped flow feel like a dead end.
+ */
+const CANCEL_MARKUP = { inline_keyboard: [[{ text: "❌ Cancel", callback_data: "cx" }]] };
+
+/** The site picker's own cancel — it has files parked in pending_media to drop. */
+function withMediaCancel(rows: InlineButton[][]): InlineButton[][] {
+  return [...rows, [{ text: "❌ Cancel", callback_data: "cxm" }]];
+}
 
 
 /**
@@ -501,6 +526,8 @@ function buttonCommand(text: string): string | null {
     timesheet: "timesheet",
     status: "status",
     myday: "today",
+    // the location prompt's reply-keyboard cancel — its only way out
+    cancel: "cancel",
     // /help stays a command even though the button gave up its slot
     help: "help",
   };
@@ -650,6 +677,18 @@ async function persistSession(row: Record<string, unknown>): Promise<void> {
 /** Clear transient draft keys, keeping the sticky project. */
 function resetDraft(_draft: Draft): Draft {
   return {};
+}
+
+/**
+ * Cancelling a PROMPT is not discarding the record. Drop whatever the question
+ * was holding, but keep an open record's card link so the next photo still
+ * edits that card instead of opening a second one.
+ */
+function cancelDraft(draft: Draft, openReport: Report | null): Draft {
+  if (!openReport) return resetDraft(draft);
+  const kept: Draft = { report_id: openReport.id, card_message_id: draft.card_message_id };
+  if (draft.review) kept.review = true;
+  return kept;
 }
 
 // ---------------------------------------------------------------- data access
@@ -861,6 +900,40 @@ function openReportButtons(reportId: number): InlineButton[][] {
   ];
 }
 
+/**
+ * The last stop before a record is saved. ✅ Done used to BE the save, so a
+ * worker who tapped it to see where they were had already committed; now it
+ * shows what is about to be filed and nothing is final until they say so again.
+ */
+function reviewButtons(
+  reportId: number,
+  mediaTypes: string[],
+  noteCount: number,
+): InlineButton[][] {
+  const rows: InlineButton[][] = [
+    [{ text: "✅ Confirm & save", callback_data: `rvok:${reportId}` }],
+  ];
+  if (mediaTypes.length > 0) {
+    const photos = mediaTypes.some((t) => t === "photo");
+    rows.push([{
+      text: photos ? "🖼 Preview photos" : "🖼 Preview files",
+      callback_data: `rvpv:${reportId}`,
+    }]);
+  }
+  const noteRow: InlineButton[] = [{ text: "📝 Add note", callback_data: `rn:${reportId}` }];
+  if (noteCount > 0) noteRow.push({ text: "✏️ Edit notes", callback_data: `rvn:${reportId}` });
+  rows.push(noteRow);
+  rows.push([
+    { text: "📅 Date", callback_data: `rd:${reportId}` },
+    { text: "📁 Site", callback_data: `rp:${reportId}` },
+  ]);
+  rows.push([
+    { text: "↩️ Keep adding", callback_data: `rvbk:${reportId}` },
+    { text: "🗑 Discard", callback_data: `rvdel:${reportId}` },
+  ]);
+  return rows;
+}
+
 /** Everything a record card states, gathered in one shape. */
 interface RecordCard {
   jobRef: string;
@@ -984,6 +1057,20 @@ async function openRecordCard(c: RecordCard, worker: Worker): Promise<string> {
 }
 
 /**
+ * What ✅ Done now shows: the record exactly as it will be filed, with nothing
+ * written to the database yet. Same facts as the receipt, phrased as a question.
+ */
+async function reviewCard(c: RecordCard): Promise<string> {
+  const rows: [string, string][] = [
+    ["Ref", c.jobRef],
+    ["Site", siteLine(c)],
+    ["Date", await fmtDateFull(c.reportDate)],
+  ];
+  if (c.mediaTypes.length > 0) rows.push(["Files", mediaLabel(c.mediaTypes)]);
+  return `${card("🧾 Ready to save — check it over", rows)}${await notesSection(c.notes)}`;
+}
+
+/**
  * The site question, led by what the bot already knows. Seeing date, time and
  * name filled in before the one blank field is what makes a single question
  * feel like the end of a form instead of the start of one.
@@ -1033,6 +1120,54 @@ async function latestNote(reportId: number): Promise<string | null> {
     .limit(1);
   if (error) throw error;
   return (data?.[0]?.body as string) ?? null;
+}
+
+/** How many notes the edit list offers before it stops. */
+const NOTE_LIST_LIMIT = 8;
+
+interface NoteRow {
+  id: number;
+  body: string;
+  created_at: string;
+}
+
+/** The newest notes on a record, oldest of them first — reading order. */
+async function listNotes(reportId: number): Promise<NoteRow[]> {
+  const { data, error } = await supabase
+    .from("report_notes")
+    .select("id, body, created_at")
+    .eq("report_id", reportId)
+    .order("created_at", { ascending: false })
+    .limit(NOTE_LIST_LIMIT);
+  if (error) throw error;
+  return ((data ?? []) as NoteRow[]).reverse();
+}
+
+/**
+ * A note, but only if the record it belongs to belongs to this worker. Callback
+ * data is attacker-controllable, so the ownership join is the authorization for
+ * every note-scoped button — never trust the id that came back.
+ */
+async function ownedNote(
+  noteId: number,
+  workerId: number,
+): Promise<(NoteRow & { report_id: number }) | null> {
+  if (!Number.isFinite(noteId)) return null;
+  const { data, error } = await supabase
+    .from("report_notes")
+    .select("id, body, created_at, report_id, reports!inner(worker_id)")
+    .eq("id", noteId)
+    .eq("reports.worker_id", workerId)
+    .maybeSingle();
+  if (error) throw error;
+  if (!data) return null;
+  const row = data as unknown as NoteRow & { report_id: number };
+  return {
+    id: row.id,
+    body: row.body,
+    created_at: row.created_at,
+    report_id: row.report_id,
+  };
 }
 
 /** Finalise — never delete. The files are real work whatever the worker meant. */
@@ -1119,6 +1254,74 @@ async function showOpenRecord(
     state: "idle",
     draft: { report_id: reportId, card_message_id: cardId },
   });
+}
+
+/**
+ * Draw a review-step screen over the record's card and remember it, so the
+ * review and its sub-panels (the note list, a single note, the discard
+ * confirmation) all reuse one message instead of stacking. `review` stays set
+ * on the draft so an edit made from here comes back here.
+ */
+async function showPanel(
+  chatId: number,
+  messageId: number | undefined,
+  session: Session,
+  reportId: number,
+  text: string,
+  rows: InlineButton[][],
+  queued: boolean,
+): Promise<void> {
+  const reply_markup = { inline_keyboard: rows };
+  let cardId = messageId;
+
+  if (queued && cardId !== undefined) {
+    await edit(chatId, cardId, text, { parse_mode: "HTML", reply_markup });
+  } else {
+    if (cardId !== undefined) {
+      const ok = await tg("editMessageText", {
+        chat_id: chatId,
+        message_id: cardId,
+        text,
+        parse_mode: "HTML",
+        reply_markup,
+      });
+      if (!ok) cardId = undefined;
+    }
+    if (cardId === undefined) {
+      const sent = await tg("sendMessage", {
+        chat_id: chatId,
+        text,
+        parse_mode: "HTML",
+        reply_markup,
+      });
+      cardId = (sent?.message_id as number) ?? undefined;
+    }
+  }
+
+  saveSessionSoon(session, {
+    state: "idle",
+    draft: { report_id: reportId, card_message_id: cardId, review: true },
+  });
+}
+
+async function showReviewCard(
+  chatId: number,
+  messageId: number | undefined,
+  session: Session,
+  reportId: number,
+  { queued = false }: { queued?: boolean } = {},
+): Promise<void> {
+  const c = await loadRecordCard(reportId);
+  if (!c) return;
+  await showPanel(
+    chatId,
+    messageId,
+    session,
+    reportId,
+    await reviewCard(c),
+    reviewButtons(reportId, c.mediaTypes, c.notes.length),
+    queued,
+  );
 }
 
 /**
@@ -1289,6 +1492,8 @@ async function handleMessage(message: TgMessage): Promise<void> {
       return startTextRecord(chatId, worker, session, text, openReport);
     case "adding_note":
       return saveNoteFromText(chatId, worker, session, text);
+    case "editing_note":
+      return saveEditedNote(chatId, worker, session, text);
     case "typing_date":
       return saveDateFromText(chatId, worker, session, text);
     case "choosing_project_for_media":
@@ -1787,16 +1992,16 @@ async function handleCommand(
       if (pend?.length) {
         await supabase.from("pending_media").delete().eq("chat_id", chatId);
       }
-      // An open record is closed, never dropped: its files are already archived
-      // and a worker cancelling a flow is not asking to unfile real work.
-      if (openReport) await closeReport(openReport.id, worker.id);
-      saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
+      // /cancel aborts the QUESTION, not the record. Closing an open record here
+      // meant a worker who mistyped mid-flow silently lost the ✅ Done step —
+      // finalising is now only ever an explicit confirm.
+      saveSessionSoon(session, { state: "idle", draft: cancelDraft(session.draft, openReport) });
       await send(
         chatId,
         pend?.length
           ? `Cancelled — discarded ${pend.length} unsaved file(s).`
           : openReport
-          ? `Closed ${openReport.job_ref ?? "that record"} as it stands.`
+          ? `Cancelled. ${openReport.job_ref ?? "Your record"} is still open — tap ✅ Done when you're finished.`
           : "Cancelled.",
         { reply_markup: MAIN_KEYBOARD },
       );
@@ -1838,7 +2043,8 @@ async function cmdSend(chatId: number, session: Session, openReport: Report | nu
         `It goes on ${openReport.job_ref ?? "your open record"} until you tap ✅ Done.`
       : `📷 Attach photos, videos or files (📎 below) — or just type what happened.\n` +
         `I'll ask which site it's for.`,
-    { reply_markup: MAIN_KEYBOARD },
+    // MAIN_KEYBOARD is persistent, so the slot is free for a visible way out
+    { reply_markup: CANCEL_MARKUP },
   );
 }
 
@@ -1866,7 +2072,7 @@ async function startTextRecord(
   });
   await send(chatId, await newRecordPrompt("📝 New record", worker, null), {
     parse_mode: "HTML",
-    reply_markup: { inline_keyboard: rows },
+    reply_markup: { inline_keyboard: withMediaCancel(rows) },
   });
 }
 
@@ -2370,7 +2576,7 @@ async function handleIncomingMedia(
     await send(
       chatId,
       await newRecordPrompt("📷 New record", worker, types.length > 0 ? types : [media.media_type]),
-      { parse_mode: "HTML", reply_markup: { inline_keyboard: rows } },
+      { parse_mode: "HTML", reply_markup: { inline_keyboard: withMediaCancel(rows) } },
     );
   }
 }
@@ -2498,8 +2704,12 @@ async function saveNoteFromText(
   }
   await addNote(reportId, worker.id, text);
 
-  // a record still open goes back to its own card, not to a receipt
+  // a record still open goes back to its own card, not to a receipt — and to
+  // the review card if that's where the worker tapped 📝 Add note
   if (existing.status === "open") {
+    if (session.draft.review) {
+      return showReviewCard(chatId, session.draft.card_message_id, session, reportId);
+    }
     return showOpenRecord(chatId, session.draft.card_message_id, worker, session, reportId);
   }
 
@@ -2511,6 +2721,34 @@ async function saveNoteFromText(
   });
 }
 
+/**
+ * ✏️ Rewrite: the one place text REPLACES a note instead of adding one. Add note
+ * must never overwrite, but a worker who picked a single entry and asked to
+ * rewrite it means exactly that — anything else would leave the typo behind.
+ */
+async function saveEditedNote(
+  chatId: number,
+  worker: Worker,
+  session: Session,
+  text: string,
+): Promise<void> {
+  const noteId = session.draft.note_id;
+  const note = noteId ? await ownedNote(noteId, worker.id) : null;
+  if (!note) {
+    saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
+    await send(chatId, noteId ? NOT_YOURS : "That note is no longer open.");
+    return;
+  }
+
+  const { error } = await supabase
+    .from("report_notes")
+    .update({ body: text.trim().slice(0, 2000) })
+    .eq("id", note.id);
+  if (error) throw error;
+
+  await showReviewCard(chatId, session.draft.card_message_id, session, note.report_id);
+}
+
 /** Receipt for a record we only hold the id of: read it back, then tally. */
 async function recordReceipt(reportId: number, workerId: number): Promise<string> {
   const [c, tally] = await Promise.all([loadRecordCard(reportId), recordsToday(workerId)]);
@@ -2519,9 +2757,9 @@ async function recordReceipt(reportId: number, workerId: number): Promise<string
 }
 
 /**
- * ✅ Done: the worker says the record is complete. Finalising and reading the
- * receipt back run together, and the card they tapped becomes that receipt — so
- * closing a record costs no Telegram round trip at all.
+ * ✅ Confirm & save: the second, explicit tap — the only thing that finalises a
+ * record. Finalising and reading the receipt back run together, and the review
+ * card they tapped becomes that receipt, so it costs no Telegram round trip.
  */
 async function cbFinishRecord(
   chatId: number,
@@ -2603,8 +2841,12 @@ async function saveDateFromText(
     .eq("worker_id", worker.id);
   if (error) throw error;
 
+  const cardId = session.draft.card_message_id;
+  const fromReview = session.draft.review === true;
   saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
   await send(chatId, `✅ Date set to ${await fmtDate(parsed)}.`);
+  // typing a date on the way out lands back on the review, not a step before it
+  if (fromReview) await showReviewCard(chatId, cardId, session, reportId);
 }
 
 // ---------------------------------------------------------------- timesheets
@@ -2624,7 +2866,7 @@ const TIMESHEET_GONE = "That timesheet is no longer open. Send the list again.";
 
 async function cmdTimesheet(chatId: number, session: Session): Promise<void> {
   saveSessionSoon(session, { state: "awaiting_timesheet" });
-  await send(chatId, TIMESHEET_PROMPT, { reply_markup: MAIN_KEYBOARD });
+  await send(chatId, TIMESHEET_PROMPT, { reply_markup: CANCEL_MARKUP });
 }
 
 function timesheetButtons(): InlineButton[][] {
@@ -2881,15 +3123,17 @@ async function handleTimesheetCallback(
       return tsPatch(chatId, session, { workDate: await localDate(sub === "d1" ? 1 : 0) });
     case "dt":
       saveSessionSoon(session, { state: "ts_typing_date" });
-      await send(chatId, "Send the date as 2026-08-03 or 03/08/2026.");
+      await send(chatId, "Send the date as 2026-08-03 or 03/08/2026.", {
+        reply_markup: CANCEL_MARKUP,
+      });
       return;
     case "team":
       saveSessionSoon(session, { state: "ts_typing_team" });
-      await send(chatId, "Send the team, e.g. 3.");
+      await send(chatId, "Send the team, e.g. 3.", { reply_markup: CANCEL_MARKUP });
       return;
     case "loc":
       saveSessionSoon(session, { state: "ts_typing_loc" });
-      await send(chatId, "Send the location.");
+      await send(chatId, "Send the location.", { reply_markup: CANCEL_MARKUP });
       return;
     case "x":
       if (messageId) await editKeyboard(chatId, messageId, []);
@@ -2935,8 +3179,25 @@ async function handleCallbackQuery(query: TgCallbackQuery): Promise<void> {
   const parts = query.data.split(":");
   const action = parts[0];
 
-  // every r* action edits a report → ownership is checked before dispatch
-  const reportActions = ["rn", "rd", "rdd", "rdt", "rp", "rpp", "nskip", "nfin"];
+  // every report-scoped action → ownership is checked before dispatch. The
+  // note-scoped ones (rvnx/rvne/rvnd) carry a note id instead and are checked
+  // by ownedNote, which joins back to the owning report.
+  const reportActions = [
+    "rn",
+    "rd",
+    "rdd",
+    "rdt",
+    "rp",
+    "rpp",
+    "nskip",
+    "nfin",
+    "rvok",
+    "rvpv",
+    "rvn",
+    "rvbk",
+    "rvdel",
+    "rvdel2",
+  ];
   let report: Report | null = null;
   if (reportActions.includes(action)) {
     const reportId = Number(parts[1]);
@@ -2952,10 +3213,37 @@ async function handleCallbackQuery(query: TgCallbackQuery): Promise<void> {
 
   switch (action) {
     // nskip is the retired "Skip — no description" button; old cards still carry
-    // it, and skipping was only ever a way of saying the record was finished
+    // it, and skipping was only ever a way of saying the record was finished.
+    // Neither saves any more — ✅ Done is the review step, not the commit.
     case "nskip":
     case "nfin":
-      return cbFinishRecord(chatId, messageId, session, worker, Number(parts[1]));
+      return showReviewCard(chatId, messageId, session, report!.id, {
+        queued: messageId !== undefined,
+      });
+    case "rvok":
+      return cbFinishRecord(chatId, messageId, session, worker, report!.id);
+    case "rvbk":
+      return showOpenRecord(chatId, messageId, worker, session, report!.id, {
+        queued: messageId !== undefined,
+      });
+    case "rvpv":
+      return cbPreviewMedia(chatId, session, report!.id);
+    case "rvn":
+      return cbEditNotes(chatId, messageId, session, report!.id);
+    case "rvnx":
+      return cbShowNote(chatId, messageId, session, worker, Number(parts[1]));
+    case "rvne":
+      return cbAskNoteRewrite(chatId, session, worker, Number(parts[1]));
+    case "rvnd":
+      return cbDeleteNote(chatId, messageId, session, worker, Number(parts[1]));
+    case "rvdel":
+      return cbConfirmDiscard(chatId, messageId, session, report!.id);
+    case "rvdel2":
+      return cbDiscardRecord(chatId, messageId, session, worker, report!.id);
+    case "cx":
+      return cbCancelPrompt(chatId, messageId, session, ctx.openReport, false);
+    case "cxm":
+      return cbCancelPrompt(chatId, messageId, session, ctx.openReport, true);
     case "ts":
       return handleTimesheetCallback(parts[1] ?? "", chatId, messageId, worker, session);
     case "pjm":
@@ -3082,8 +3370,271 @@ async function cbAskNote(
     prior
       ? `📝 Send the extra detail — it gets added under:\n<i>${esc(oneLine(prior, 90))}</i>`
       : "📝 Send the description for this record.",
-    prior ? { parse_mode: "HTML" } : {},
+    prior
+      ? { parse_mode: "HTML", reply_markup: CANCEL_MARKUP }
+      : { reply_markup: CANCEL_MARKUP },
   );
+}
+
+// ---------------------------------------------------------------- review step
+
+const PREVIEW_UNAVAILABLE = "Preview unavailable — the files are saved.";
+
+/** Telegram's own cap on one media group. */
+const MEDIA_GROUP_MAX = 10;
+
+/** Documents can't ride a media group, so they cost a round trip each. */
+const PREVIEW_DOC_MAX = 5;
+
+/**
+ * 🖼 Preview: hand the worker's own files back before they commit. Every stored
+ * file kept its telegram_file_id, so Telegram serves its cached copy — no
+ * download, no upload, near-instant. An expired id is not worth failing over:
+ * the files are archived either way, so say so and move on.
+ */
+async function cbPreviewMedia(
+  chatId: number,
+  session: Session,
+  reportId: number,
+): Promise<void> {
+  const { data, error } = await supabase
+    .from("report_media")
+    .select("telegram_file_id, media_type")
+    .eq("report_id", reportId)
+    .order("id");
+  if (error) throw error;
+
+  const files = ((data ?? []) as { telegram_file_id: string | null; media_type: string }[])
+    .filter((f): f is { telegram_file_id: string; media_type: string } => Boolean(f.telegram_file_id));
+
+  const groupable = files.filter((f) => f.media_type === "photo" || f.media_type === "video");
+  const docs = files.filter((f) => f.media_type === "document");
+
+  let shown = 0;
+  for (let i = 0; i < groupable.length; i += MEDIA_GROUP_MAX) {
+    const chunk = groupable.slice(i, i + MEDIA_GROUP_MAX);
+    // Telegram rejects a media group of one — a lone file (or the remainder of
+    // an eleventh) goes out as itself.
+    if (chunk.length === 1) {
+      const one = chunk[0];
+      const method = one.media_type === "video" ? "sendVideo" : "sendPhoto";
+      const key = one.media_type === "video" ? "video" : "photo";
+      if (await tg(method, { chat_id: chatId, [key]: one.telegram_file_id })) shown++;
+      continue;
+    }
+    const sent = await tg("sendMediaGroup", {
+      chat_id: chatId,
+      media: chunk.map((f) => ({
+        type: f.media_type === "video" ? "video" : "photo",
+        media: f.telegram_file_id,
+      })),
+    });
+    if (sent) shown += chunk.length;
+  }
+  for (const d of docs.slice(0, PREVIEW_DOC_MAX)) {
+    if (await tg("sendDocument", { chat_id: chatId, document: d.telegram_file_id })) shown++;
+  }
+
+  if (files.length > 0 && shown === 0) {
+    await send(chatId, PREVIEW_UNAVAILABLE);
+  } else if (docs.length > PREVIEW_DOC_MAX) {
+    await send(chatId, `…and ${docs.length - PREVIEW_DOC_MAX} more file(s) — all saved.`);
+  }
+
+  // the files pushed the card off the screen — put the buttons back within reach
+  await showReviewCard(chatId, undefined, session, reportId);
+}
+
+/** The record's notes, one button each, so a single entry can be fixed. */
+async function cbEditNotes(
+  chatId: number,
+  messageId: number | undefined,
+  session: Session,
+  reportId: number,
+): Promise<void> {
+  const notes = await listNotes(reportId);
+  if (notes.length === 0) {
+    return showReviewCard(chatId, messageId, session, reportId, {
+      queued: messageId !== undefined,
+    });
+  }
+
+  const rows: InlineButton[][] = [];
+  for (const n of notes) {
+    rows.push([{
+      text: `${await fmtTime(n.created_at)}  ${oneLine(n.body, 28)}`,
+      callback_data: `rvnx:${n.id}`,
+    }]);
+  }
+  rows.push([{ text: "↩️ Back", callback_data: `nfin:${reportId}` }]);
+
+  await showPanel(
+    chatId,
+    messageId,
+    session,
+    reportId,
+    "<b>✏️ Which note?</b>\nTap one to rewrite or delete it.",
+    rows,
+    messageId !== undefined,
+  );
+}
+
+async function cbShowNote(
+  chatId: number,
+  messageId: number | undefined,
+  session: Session,
+  worker: Worker,
+  noteId: number,
+): Promise<void> {
+  const note = await ownedNote(noteId, worker.id);
+  if (!note) {
+    await send(chatId, NOT_YOURS);
+    return;
+  }
+  await showPanel(
+    chatId,
+    messageId,
+    session,
+    note.report_id,
+    `<b>📝 Note · ${await fmtTime(note.created_at)}</b>\n<pre>${esc(note.body)}</pre>`,
+    [
+      [
+        { text: "✏️ Rewrite", callback_data: `rvne:${note.id}` },
+        { text: "🗑 Delete", callback_data: `rvnd:${note.id}` },
+      ],
+      [{ text: "↩️ Back", callback_data: `rvn:${note.report_id}` }],
+    ],
+    messageId !== undefined,
+  );
+}
+
+async function cbAskNoteRewrite(
+  chatId: number,
+  session: Session,
+  worker: Worker,
+  noteId: number,
+): Promise<void> {
+  const note = await ownedNote(noteId, worker.id);
+  if (!note) {
+    await send(chatId, NOT_YOURS);
+    return;
+  }
+  saveSessionSoon(session, {
+    state: "editing_note",
+    draft: { ...session.draft, report_id: note.report_id, note_id: note.id },
+  });
+  await send(
+    chatId,
+    `✏️ Send the new wording — it REPLACES:\n<i>${esc(oneLine(note.body, 90))}</i>`,
+    { parse_mode: "HTML", reply_markup: CANCEL_MARKUP },
+  );
+}
+
+async function cbDeleteNote(
+  chatId: number,
+  messageId: number | undefined,
+  session: Session,
+  worker: Worker,
+  noteId: number,
+): Promise<void> {
+  const note = await ownedNote(noteId, worker.id);
+  if (!note) {
+    await send(chatId, NOT_YOURS);
+    return;
+  }
+  const { error } = await supabase.from("report_notes").delete().eq("id", note.id);
+  if (error) throw error;
+  // back to the list, or to the review once the last one is gone
+  await cbEditNotes(chatId, messageId, session, note.report_id);
+}
+
+/**
+ * 🗑 Discard asks first and names what goes: the files are already in the bucket
+ * by this point, so there is nothing to undo once it runs.
+ */
+async function cbConfirmDiscard(
+  chatId: number,
+  messageId: number | undefined,
+  session: Session,
+  reportId: number,
+): Promise<void> {
+  const c = await loadRecordCard(reportId);
+  const files = c?.mediaTypes.length ?? 0;
+  await showPanel(
+    chatId,
+    messageId,
+    session,
+    reportId,
+    esc(`🗑 Discard this record and its ${files} file(s)? This cannot be undone.`),
+    [[
+      { text: "🗑 Yes, discard", callback_data: `rvdel2:${reportId}` },
+      { text: "↩️ No, keep it", callback_data: `nfin:${reportId}` },
+    ]],
+    messageId !== undefined,
+  );
+}
+
+async function cbDiscardRecord(
+  chatId: number,
+  messageId: number | undefined,
+  session: Session,
+  worker: Worker,
+  reportId: number,
+): Promise<void> {
+  const { data, error } = await supabase
+    .from("report_media")
+    .select("storage_path")
+    .eq("report_id", reportId);
+  if (error) throw error;
+
+  // Bucket first: the row deletion cascades report_media away, and an object
+  // with no row pointing at it is invisible rubbish nobody will ever clean up.
+  const paths = ((data ?? []) as { storage_path: string | null }[])
+    .map((m) => m.storage_path)
+    .filter((p): p is string => Boolean(p));
+  if (paths.length > 0) {
+    const removed = await supabase.storage.from("site-media").remove(paths);
+    // a failure here is a stray object, not a reason to keep a record the
+    // worker just said they don't want
+    if (removed.error) console.error("discard: storage remove failed", removed.error);
+  }
+
+  const del = await supabase
+    .from("reports")
+    .delete()
+    .eq("id", reportId)
+    .eq("worker_id", worker.id);
+  if (del.error) throw del.error;
+
+  saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
+  const line = "🗑 Discarded. Nothing was saved.";
+  if (messageId) await edit(chatId, messageId, line, { reply_markup: { inline_keyboard: [] } });
+  else await send(chatId, line);
+}
+
+/**
+ * ❌ Cancel on any prompt. It abandons the question, never the record: an open
+ * record keeps its card link so the next photo still joins it. `purgeMedia` is
+ * the site picker's variant — its files are parked in pending_media and would
+ * otherwise be adopted by whatever batch came next.
+ */
+async function cbCancelPrompt(
+  chatId: number,
+  messageId: number | undefined,
+  session: Session,
+  openReport: Report | null,
+  purgeMedia: boolean,
+): Promise<void> {
+  if (purgeMedia) {
+    const { error } = await supabase.from("pending_media").delete().eq("chat_id", chatId);
+    if (error) throw error;
+  }
+  saveSessionSoon(session, { state: "idle", draft: cancelDraft(session.draft, openReport) });
+
+  const line = purgeMedia ? "Cancelled — files discarded." : "Cancelled.";
+  // the prompt becomes its own answer rather than leaving a question hanging
+  if (messageId) await edit(chatId, messageId, line, { reply_markup: { inline_keyboard: [] } });
+  else await send(chatId, line);
 }
 
 async function cbShowDateOptions(
@@ -3120,6 +3671,10 @@ function refreshRecordCard(
   report: Report,
 ): Promise<void> {
   if (report.status === "open") {
+    // an edit reached from the review goes back to the review, not a step before
+    if (session.draft.review) {
+      return showReviewCard(chatId, messageId, session, report.id, { queued: true });
+    }
     return showOpenRecord(chatId, messageId, worker, session, report.id, { queued: true });
   }
   return refreshReportCard(chatId, messageId, report.id);
@@ -3177,7 +3732,9 @@ async function cbAskTypedDate(chatId: number, session: Session, reportId: number
     state: "typing_date",
     draft: { ...session.draft, report_id: reportId },
   });
-  await send(chatId, "Send the date as 2026-08-03 or 03/08/2026.");
+  await send(chatId, "Send the date as 2026-08-03 or 03/08/2026.", {
+    reply_markup: CANCEL_MARKUP,
+  });
 }
 
 async function cbShowProjectOptions(
