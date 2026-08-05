@@ -704,6 +704,7 @@ interface BotContext {
   session: Session;
   groupLink: GroupLink | null;
   openReport: Report | null;
+  projects: Project[];
 }
 
 async function loadBotContext(chatId: number, telegramUserId: number): Promise<BotContext> {
@@ -719,17 +720,42 @@ async function loadBotContext(chatId: number, telegramUserId: number): Promise<B
     group_link?: GroupLink | null;
     settings?: Record<string, unknown> | null;
     open_report?: Report | null;
+    projects?: Project[] | null;
   };
   // the settings cache rides along, so getSettings() almost never reads
   cacheSettings(ctx.settings);
+  cacheProjects(ctx.worker?.id, ctx.projects);
 
   return {
     worker: ctx.worker ?? null,
     session: sessionFromRow(chatId, ctx.session),
     groupLink: ctx.group_link ?? null,
     openReport: ctx.open_report ?? null,
+    projects: ctx.projects ?? [],
   };
 }
+
+/**
+ * bot_context already returns the worker's sites on every message, so prime the
+ * cache with them. listProjects then answers from memory instead of spending a
+ * round trip to draw a picker — the pick path was the slowest thing a worker
+ * touched, and it was re-reading a list we had just fetched.
+ */
+const PROJECTS_TTL_MS = 5 * 60_000;
+const projectCache = new Map<number, { at: number; rows: Project[] }>();
+
+function cacheProjects(workerId: number | undefined, rows: Project[] | null | undefined): void {
+  if (!workerId || !rows) return;
+  projectCache.set(workerId, { at: Date.now(), rows });
+}
+
+function cachedProjects(workerId: number): Project[] | null {
+  const hit = projectCache.get(workerId);
+  if (hit && Date.now() - hit.at < PROJECTS_TTL_MS) return hit.rows;
+  if (hit) projectCache.delete(workerId);
+  return null;
+}
+
 
 async function getProject(projectId: number): Promise<Project | null> {
   const { data, error } = await supabase
@@ -743,6 +769,9 @@ async function getProject(projectId: number): Promise<Project | null> {
 
 /** Projects assigned to the worker; falls back to every active project. */
 async function listProjects(workerId: number): Promise<Project[]> {
+  const warm = cachedProjects(workerId);
+  if (warm) return warm;
+
   const assigned = await supabase
     .from("project_workers")
     .select("projects!inner(id, code, name, status)")
@@ -756,7 +785,9 @@ async function listProjects(workerId: number): Promise<Project[]> {
     .map((p) => ({ id: p.id, code: p.code, name: p.name }));
 
   if (mine.length > 0) {
-    return mine.sort((a, b) => a.code.localeCompare(b.code));
+    const sorted = mine.sort((a, b) => a.code.localeCompare(b.code));
+    cacheProjects(workerId, sorted);
+    return sorted;
   }
 
   const all = await supabase
@@ -765,7 +796,9 @@ async function listProjects(workerId: number): Promise<Project[]> {
     .eq("status", "active")
     .order("code");
   if (all.error) throw all.error;
-  return (all.data ?? []) as Project[];
+  const rows = (all.data ?? []) as Project[];
+  cacheProjects(workerId, rows);
+  return rows;
 }
 
 async function openAttendance(workerId: number): Promise<Attendance | null> {
@@ -3111,22 +3144,39 @@ async function handleTimesheetCallback(
           { text: "Today", callback_data: "ts:d0" },
           { text: "Yesterday", callback_data: "ts:d1" },
         ],
-        [{ text: "✍️ Type date", callback_data: "ts:dt" }],
       ];
+      // picked, never typed — same reasoning as the record date
+      const zone = await tz();
+      let dayRow: InlineButton[] = [];
+      for (let back = 2; back < 7; back++) {
+        const day = await localDate(back);
+        dayRow.push({
+          text: new Intl.DateTimeFormat("en-GB", {
+            timeZone: zone,
+            weekday: "short",
+            day: "numeric",
+          }).format(new Date(`${day}T12:00:00Z`)),
+          callback_data: `ts:d${back}`,
+        });
+        if (dayRow.length === 2) {
+          rows.push(dayRow);
+          dayRow = [];
+        }
+      }
+      if (dayRow.length) rows.push(dayRow);
       if (messageId) await editKeyboard(chatId, messageId, rows);
       else await send(chatId, "Which date?", { reply_markup: { inline_keyboard: rows } });
       return;
     }
     case "d0":
     case "d1":
+    case "d2":
+    case "d3":
+    case "d4":
+    case "d5":
+    case "d6":
       if (messageId) await editKeyboard(chatId, messageId, []);
-      return tsPatch(chatId, session, { workDate: await localDate(sub === "d1" ? 1 : 0) });
-    case "dt":
-      saveSessionSoon(session, { state: "ts_typing_date" });
-      await send(chatId, "Send the date as 2026-08-03 or 03/08/2026.", {
-        reply_markup: CANCEL_MARKUP,
-      });
-      return;
+      return tsPatch(chatId, session, { workDate: await localDate(Number(sub.slice(1))) });
     case "team":
       saveSessionSoon(session, { state: "ts_typing_team" });
       await send(chatId, "Send the team, e.g. 3.", { reply_markup: CANCEL_MARKUP });
@@ -3186,7 +3236,6 @@ async function handleCallbackQuery(query: TgCallbackQuery): Promise<void> {
     "rn",
     "rd",
     "rdd",
-    "rdt",
     "rp",
     "rpp",
     "nskip",
@@ -3261,8 +3310,6 @@ async function handleCallbackQuery(query: TgCallbackQuery): Promise<void> {
       return cbShowDateOptions(chatId, messageId, Number(parts[1]));
     case "rdd":
       return cbSetRelativeDate(chatId, messageId, worker, session, report!, Number(parts[2]));
-    case "rdt":
-      return cbAskTypedDate(chatId, session, Number(parts[1]));
     case "rp":
       return cbShowProjectOptions(chatId, messageId, worker, Number(parts[1]));
     case "rpp":
@@ -3642,13 +3689,29 @@ async function cbShowDateOptions(
   messageId: number | undefined,
   reportId: number,
 ): Promise<void> {
-  const rows: InlineButton[][] = [
-    [
-      { text: "Today", callback_data: `rdd:${reportId}:0` },
-      { text: "Yesterday", callback_data: `rdd:${reportId}:1` },
-    ],
-    [{ text: "✍️ Type date", callback_data: `rdt:${reportId}` }],
-  ];
+  // Days are picked, never typed. A worker on a site with wet gloves should not
+  // be parsing "03/08/2026 or 2026-08-03" — and a typo there silently files the
+  // record under the wrong day, which is exactly what this system exists to
+  // prevent. Backfilling more than a week late isn't a real case.
+  const zone = await tz();
+  const labels = ["Today", "Yesterday"];
+  const rows: InlineButton[][] = [];
+  let row: InlineButton[] = [];
+
+  for (let back = 0; back < 7; back++) {
+    const day = await localDate(back);
+    const text = back < 2
+      ? labels[back]
+      : new Intl.DateTimeFormat("en-GB", { timeZone: zone, weekday: "short", day: "numeric" })
+        .format(new Date(`${day}T12:00:00Z`));
+    row.push({ text, callback_data: `rdd:${reportId}:${back}` });
+    if (row.length === 2) {
+      rows.push(row);
+      row = [];
+    }
+  }
+  if (row.length) rows.push(row);
+
   if (messageId) await editKeyboard(chatId, messageId, rows);
   else await send(chatId, "Which date?", { reply_markup: { inline_keyboard: rows } });
 }
@@ -3725,16 +3788,6 @@ async function cbSetRelativeDate(
   if (error) throw error;
   if (messageId) await refreshRecordCard(chatId, messageId, worker, session, report);
   else await send(chatId, `✅ Date set to ${await fmtDate(date)}.`);
-}
-
-async function cbAskTypedDate(chatId: number, session: Session, reportId: number): Promise<void> {
-  saveSessionSoon(session, {
-    state: "typing_date",
-    draft: { ...session.draft, report_id: reportId },
-  });
-  await send(chatId, "Send the date as 2026-08-03 or 03/08/2026.", {
-    reply_markup: CANCEL_MARKUP,
-  });
 }
 
 async function cbShowProjectOptions(

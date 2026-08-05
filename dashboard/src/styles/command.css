@@ -751,14 +751,14 @@ table.data th {
 
 .review-list {
   display: grid;
-  gap: 7px;
-  margin-top: 2px;
+  gap: 9px;
+  margin-top: 5px;
 }
 
 .review-item {
   position: relative;
-  min-height: 96px;
-  padding: 10px 56px 10px 11px;
+  min-height: 106px;
+  padding: 14px 60px 13px 15px;
   border: 1px solid oklch(0.86 0.04 255 / 0.68);
   border-radius: 12px;
   background: oklch(0.99 0.01 250 / 0.42);
@@ -767,8 +767,8 @@ table.data th {
 
 .review-mark {
   position: absolute;
-  top: 10px;
-  right: 11px;
+  top: 14px;
+  right: 14px;
   width: 36px;
   height: 36px;
   object-fit: contain;
@@ -779,6 +779,7 @@ table.data th {
   font-size: 8px;
   font-weight: 750;
   letter-spacing: 0.11em;
+  line-height: 1.25;
   text-transform: uppercase;
 }
 
@@ -786,7 +787,7 @@ table.data th {
   display: flex;
   align-items: baseline;
   gap: 6px;
-  margin-top: 2px;
+  margin-top: 5px;
 }
 
 .review-title-row strong {
@@ -803,19 +804,21 @@ table.data th {
   font-size: 11px;
   font-weight: 680;
   letter-spacing: -0.015em;
+  line-height: 1.2;
 }
 
 .review-detail {
-  margin-top: 3px;
+  margin-top: 5px;
   color: var(--ink-2);
   font-size: 9px;
+  line-height: 1.35;
 }
 
 .review-action {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  margin-top: 6px;
+  margin-top: 9px;
   color: var(--blue-dark);
   font-size: 9px;
   font-weight: 700;

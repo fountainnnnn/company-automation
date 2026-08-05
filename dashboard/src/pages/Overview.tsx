@@ -593,7 +593,7 @@ function ReviewQueue({
           )}
           {isAdmin && payrollExceptions > 0 && (
             <ReviewItem
-              iconSrc="/ui-icons/payroll-readiness.svg"
+              iconSrc="/ui-icons/payroll-readiness.png?v=2"
               category="Payroll readiness"
               count={payrollExceptions}
               label={payrollExceptions === 1 ? "payroll issue" : "payroll issues"}
