@@ -65,7 +65,8 @@ export function ProjectsPage() {
       }
       setStats(nextStats);
 
-      const urls = await getSignedUrls(Object.values(pick));
+      // covers are card-sized — never ship a 1280px original for a thumbnail
+      const urls = await getSignedUrls(Object.values(pick), true);
       if (!active) return;
       const nextCovers: Record<string, string> = {};
       for (const [pid, path] of Object.entries(pick)) {

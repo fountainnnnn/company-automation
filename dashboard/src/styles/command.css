@@ -351,17 +351,108 @@ body {
   padding: 14px;
 }
 
-/* the two ranked-bar cards; one stretches full width when the other is admin-only */
-.command-charts {
+.command-analytics {
   grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-  gap: 14px;
-  align-items: start;
+  gap: 12px;
+  margin: 8px 0 2px;
+}
+
+.command-section-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 0 4px;
+}
+
+.command-section-kicker {
+  margin-bottom: 2px;
+  color: var(--blue-dark);
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.command-section-heading h3 {
+  color: var(--ink);
+  font-size: 18px;
+  font-weight: 680;
+  letter-spacing: -0.025em;
+}
+
+.command-section-heading > span {
+  padding-bottom: 2px;
+  color: var(--ink-2);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+/* One compact analytical row with consistent card rhythm. */
+.command-charts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  align-items: stretch;
+}
+
+.command-charts .command-chart {
+  display: flex;
+  flex-direction: column;
+  min-height: 258px;
+}
+
+.command-charts .bar-list {
+  flex: 1;
+  justify-content: flex-start;
+  gap: 12px;
 }
 
 .command-ot {
-  grid-column: 1 / -1;
+  min-width: 0;
+}
+
+.command-charts .command-panel-head {
+  min-height: 44px;
+  align-items: flex-start;
+  margin-bottom: 10px;
+}
+
+.command-charts .bar-row {
+  grid-template-columns: minmax(68px, 0.8fr) minmax(80px, 1.55fr) minmax(54px, auto);
+  column-gap: 8px;
+  row-gap: 2px;
+}
+
+.command-charts .bar-track {
+  height: 8px;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.command-charts .bar-fill {
+  border-radius: inherit;
+}
+
+.command-charts .bar-label,
+.command-charts .bar-value {
+  font-size: 10px;
+}
+
+.command-charts .bar-sub-line {
+  font-size: 8.5px;
+  line-height: 1.25;
+}
+
+.command-ot .chart-legend {
+  gap: 10px;
+  margin-bottom: 2px;
+  font-size: 9px;
+}
+
+.command-ot .axis-label {
+  font-size: 9px;
 }
 
 .command-panel-title h3 {
@@ -436,61 +527,79 @@ body {
 }
 
 .review-list {
-  margin: 0 -14px;
-  border-top: 1px solid var(--hairline);
+  display: grid;
+  gap: 10px;
+  margin-top: 2px;
 }
 
 .review-item {
-  display: grid;
-  grid-template-columns: 34px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 10px;
-  min-height: 82px;
-  padding: 12px 14px;
-  border-bottom: 1px solid var(--hairline);
+  position: relative;
+  min-height: 126px;
+  padding: 14px 72px 13px 14px;
+  border: 1px solid oklch(0.86 0.04 255 / 0.68);
+  border-radius: 12px;
+  background: oklch(0.99 0.01 250 / 0.42);
+  box-shadow: inset 0 1px 0 oklch(0.99 0.01 250 / 0.7);
 }
 
-.review-icon {
-  display: grid;
-  width: 32px;
-  height: 32px;
-  place-items: center;
-  border-radius: 9px;
+.review-mark {
+  position: absolute;
+  top: 13px;
+  right: 14px;
+  width: 46px;
+  height: 46px;
+  object-fit: contain;
 }
 
-.review-icon.flag {
-  color: var(--flag-ink);
-  background: var(--flag-tint);
+.review-category {
+  color: var(--ink-3);
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
 }
 
-.review-icon.warn {
-  color: var(--warn-ink);
-  background: var(--warn-tint);
+.review-title-row {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  margin-top: 3px;
 }
 
-.review-item strong,
-.review-item span {
-  display: block;
-}
-
-.review-item strong {
+.review-title-row strong {
   color: var(--ink);
-  font-size: 12px;
+  font-size: 26px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.045em;
+  line-height: 1;
 }
 
-.review-item div > span {
-  margin-top: 2px;
+.review-title-row h4 {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 680;
+  letter-spacing: -0.015em;
+}
+
+.review-detail {
+  margin-top: 4px;
   color: var(--ink-2);
   font-size: 10px;
 }
 
-.review-item > a {
-  padding: 6px 9px;
-  border: 1px solid oklch(0.64 0.19 258 / 0.65);
-  border-radius: 7px;
+.review-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 9px;
   color: var(--blue-dark);
   font-size: 10px;
   font-weight: 700;
+}
+
+.review-action:hover {
+  color: var(--blue);
 }
 
 .review-updated {
@@ -821,6 +930,12 @@ body {
 }
 
 @media (max-width: 640px) {
+  .command-charts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .command-section-heading {
+    align-items: flex-start;
+  }
   .command-heading {
     flex-direction: column;
   }

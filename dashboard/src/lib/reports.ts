@@ -68,10 +68,14 @@ export function visibleReports(reports: Report[], mediaType: string): Report[] {
   return reports.filter((r) => mediaOf(r, mediaType).length > 0);
 }
 
+/**
+ * Grid/cover URLs — resized server-side. The Lightbox re-signs the one image
+ * being viewed at full resolution, so nothing here needs the original.
+ */
 export async function signReportMedia(reports: Report[]): Promise<Record<string, string>> {
   const paths = reports.flatMap((r) => (r.report_media ?? []).map((m) => m.storage_path));
   if (paths.length === 0) return {};
-  return getSignedUrls(paths);
+  return getSignedUrls(paths, true);
 }
 
 export function groupByDate(reports: Report[]): Array<[string, Report[]]> {

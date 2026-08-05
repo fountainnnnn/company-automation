@@ -6,9 +6,7 @@ import {
   Check,
   Clock3,
   FileImage,
-  Flag,
   RefreshCw,
-  UserPlus,
 } from "lucide-react";
 import { EmptyState } from "../components/EmptyState";
 import { SectionHeader } from "../components/SectionHeader";
@@ -226,22 +224,23 @@ export function OverviewPage() {
 function CommandSkeleton({ isAdmin }: { isAdmin: boolean }) {
   return (
     <div className="command-board" aria-busy="true" aria-label="Loading operations overview">
+      <div className="command-metrics glass-panel"><Skeleton height={72} radius={12} /></div>
+      <div className="command-analytics">
+        <Skeleton height={34} width="24%" />
+        <div className="command-charts">
+          <div className="command-chart glass-panel"><Skeleton height={250} radius={12} /></div>
+          {isAdmin && (
+            <>
+              <div className="command-chart glass-panel"><Skeleton height={250} radius={12} /></div>
+              <div className="command-chart command-ot glass-panel"><Skeleton height={250} radius={12} /></div>
+            </>
+          )}
+        </div>
+      </div>
       <div className="command-map glass-panel"><Skeleton height={330} radius={14} /></div>
       <div className="command-review glass-panel"><Skeleton height={330} radius={14} /></div>
-      <div className="command-metrics glass-panel"><Skeleton height={72} radius={12} /></div>
       <div className="command-sites glass-panel"><Skeleton height={260} radius={12} /></div>
       <div className="command-activity glass-panel"><Skeleton height={260} radius={12} /></div>
-      <div className="command-charts">
-        <div className="command-chart glass-panel"><Skeleton height={210} radius={12} /></div>
-        {isAdmin && (
-          <div className="command-chart glass-panel"><Skeleton height={210} radius={12} /></div>
-        )}
-      </div>
-      {isAdmin && (
-        <div className="command-chart command-ot glass-panel">
-          <Skeleton height={250} radius={12} />
-        </div>
-      )}
     </div>
   );
 }
@@ -331,6 +330,70 @@ function CommandBoard({ data, isAdmin }: { data: OverviewData; isAdmin: boolean 
 
   return (
     <div className="command-board">
+      <section className="command-metrics glass-panel" aria-label="Today at a glance">
+        <div className="metric-intro">
+          <strong>Today</strong>
+          <span>{formatDayShort(toSgtDay(new Date()))}</span>
+        </div>
+        <Metric label="Workers on site" value={String(stats.on_site_now)} sub={`${stats.active_workers} active`} />
+        <Metric label="Reports this week" value={String(stats.reports_7d)} sub={`${stats.reports_30d} in 30d`} trend={trend} />
+        <Metric label="Hours logged" value={stats.hours_7d.toFixed(1)} sub="last 7 days" />
+        <Metric label="Files received" value={String(stats.media_7d)} sub={`${stats.media_total} total`} trend={mediaTrend} />
+      </section>
+
+      <section className="command-analytics" aria-labelledby="workforce-insights-title">
+        <div className="command-section-heading">
+          <div>
+            <p className="command-section-kicker">Workforce intelligence</p>
+            <h3 id="workforce-insights-title">Performance and labour</h3>
+          </div>
+          <span>Last {data.range} days</span>
+        </div>
+
+        <div className="command-charts">
+          <ChartPanel
+            id="team-hours-title"
+            title="Team performance"
+            subtitle="Hours logged by active crew"
+          >
+            <RankedBars
+              items={teamBars}
+              label="Hours logged per team"
+              format={(v) => `${formatHours(v)}h`}
+              emptyTitle="No timesheets in this window"
+              emptyHint="Crew hours appear once a supervisor files the daily roster."
+            />
+          </ChartPanel>
+
+          {isAdmin && (
+            <ChartPanel
+              id="site-cost-title"
+              title="Labour cost by site"
+              subtitle="Gross pay from completed shifts"
+            >
+              <RankedBars
+                items={costBars.slice(0, 4)}
+                label="Gross pay per site"
+                format={(v) => formatMoney(v, { cents: false })}
+                emptyTitle="No priced shifts in this window"
+                emptyHint="Pay is counted once a shift is checked out and the worker has a rate."
+              />
+            </ChartPanel>
+          )}
+
+          {isAdmin && (
+            <ChartPanel
+              id="ot-trend-title"
+              className="command-ot"
+              title="Overtime trend"
+              subtitle="Normal and overtime hours by week"
+            >
+              <StackedHoursChart data={data.otDays} />
+            </ChartPanel>
+          )}
+        </div>
+      </section>
+
       <section className="command-map glass-panel" aria-labelledby="live-sites-title">
         <div className="command-panel-head map-head">
           <div>
@@ -343,17 +406,6 @@ function CommandBoard({ data, isAdmin }: { data: OverviewData; isAdmin: boolean 
       </section>
 
       <ReviewQueue stats={stats} isAdmin={isAdmin} />
-
-      <section className="command-metrics glass-panel" aria-label="Today at a glance">
-        <div className="metric-intro">
-          <strong>Today</strong>
-          <span>{formatDayShort(toSgtDay(new Date()))}</span>
-        </div>
-        <Metric label="Workers on site" value={String(stats.on_site_now)} sub={`${stats.active_workers} active`} />
-        <Metric label="Reports this week" value={String(stats.reports_7d)} sub={`${stats.reports_30d} in 30d`} trend={trend} />
-        <Metric label="Hours logged" value={stats.hours_7d.toFixed(1)} sub="last 7 days" />
-        <Metric label="Files received" value={String(stats.media_7d)} sub={`${stats.media_total} total`} trend={mediaTrend} />
-      </section>
 
       <section className="command-sites glass-panel" aria-labelledby="latest-sites-title">
         <div className="command-panel-head">
@@ -411,48 +463,6 @@ function CommandBoard({ data, isAdmin }: { data: OverviewData; isAdmin: boolean 
         )}
       </section>
 
-      <div className="command-charts">
-        <ChartPanel
-          id="team-hours-title"
-          title="Team performance"
-          subtitle={`Hours logged, last ${data.range} days`}
-        >
-          <RankedBars
-            items={teamBars}
-            label="Hours logged per team"
-            format={(v) => `${formatHours(v)}h`}
-            emptyTitle="No timesheets in this window"
-            emptyHint="Crew hours appear once a supervisor files the daily roster."
-          />
-        </ChartPanel>
-
-        {isAdmin && (
-          <ChartPanel
-            id="site-cost-title"
-            title="Labour cost by site"
-            subtitle={`Gross pay, last ${data.range} days`}
-          >
-            <RankedBars
-              items={costBars}
-              label="Gross pay per site"
-              format={(v) => formatMoney(v, { cents: false })}
-              emptyTitle="No priced shifts in this window"
-              emptyHint="Pay is counted once a shift is checked out and the worker has a rate."
-            />
-          </ChartPanel>
-        )}
-      </div>
-
-      {isAdmin && (
-        <ChartPanel
-          id="ot-trend-title"
-          className="command-ot"
-          title="Overtime trend"
-          subtitle="Overtime is every hour past a worker's expected day"
-        >
-          <StackedHoursChart data={data.otDays} />
-        </ChartPanel>
-      )}
     </div>
   );
 }
@@ -505,22 +515,22 @@ function ReviewQueue({ stats, isAdmin }: { stats: OverviewStats; isAdmin: boolea
         <div className="review-list">
           {stats.open_flags > 0 && (
             <ReviewItem
-              icon={<Flag size={18} aria-hidden="true" />}
+              iconSrc="/ui-icons/attendance-review-transparent.png"
+              category="Attendance control"
               count={stats.open_flags}
               label="attendance flags"
               detail="Location checks need review"
               to={isAdmin ? "/attendance" : undefined}
-              tone="flag"
             />
           )}
           {stats.pending_workers > 0 && (
             <ReviewItem
-              icon={<UserPlus size={18} aria-hidden="true" />}
+              iconSrc="/ui-icons/worker-approval-transparent.png"
+              category="Workforce access"
               count={stats.pending_workers}
               label="pending workers"
               detail="Telegram registrations"
               to={isAdmin ? "/workers" : undefined}
-              tone="warn"
             />
           )}
         </div>
@@ -531,29 +541,35 @@ function ReviewQueue({ stats, isAdmin }: { stats: OverviewStats; isAdmin: boolea
 }
 
 function ReviewItem({
-  icon,
+  iconSrc,
+  category,
   count,
   label,
   detail,
   to,
-  tone,
 }: {
-  icon: ReactNode;
+  iconSrc: string;
+  category: string;
   count: number;
   label: string;
   detail: string;
   to?: string;
-  tone: "flag" | "warn";
 }) {
   return (
-    <div className="review-item">
-      <span className={`review-icon ${tone}`}>{icon}</span>
-      <div>
-        <strong>{count} {label}</strong>
-        <span>{detail}</span>
+    <article className="review-item">
+      <img className="review-mark" src={iconSrc} alt="" aria-hidden="true" />
+      <p className="review-category">{category}</p>
+      <div className="review-title-row">
+        <strong>{count}</strong>
+        <h4>{label}</h4>
       </div>
-      {to && <Link to={to}>Review</Link>}
-    </div>
+      <p className="review-detail">{detail}</p>
+      {to && (
+        <Link className="review-action" to={to}>
+          Review queue <ArrowUpRight size={14} aria-hidden="true" />
+        </Link>
+      )}
+    </article>
   );
 }
 

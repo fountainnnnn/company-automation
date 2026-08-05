@@ -5,17 +5,19 @@ import { useElementWidth } from "../../lib/useElementWidth";
 import type { OtDayRow } from "../../lib/types";
 import { niceTicks } from "./ActivityChart";
 
-const HEIGHT = 240;
-const PAD = { top: 14, right: 14, bottom: 26, left: 44 };
-/** Fixed series order — hues are identity here, never rank. */
+const HEIGHT = 184;
+const PAD = { top: 8, right: 8, bottom: 30, left: 34 };
 const NORMAL = "var(--series-1)";
 const OT = "var(--series-2)";
 
-/**
- * Normal and overtime hours per day, stacked on one shared y-axis. Columns
- * rather than an area: OT is a daily quantity, and a filled curve would imply
- * hours flow between days.
- */
+type WeeklyHours = {
+  start: string;
+  end: string;
+  normal_hours: number;
+  ot_hours: number;
+};
+
+/** Compact weekly totals keep the dashboard legible without hiding hours. */
 export function StackedHoursChart({ data }: { data: OtDayRow[] }) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const width = useElementWidth(wrapRef);
@@ -31,22 +33,32 @@ export function StackedHoursChart({ data }: { data: OtDayRow[] }) {
     );
   }
 
+  const buckets: WeeklyHours[] = [];
+  for (let end = data.length; end > 0; end -= 7) {
+    const rows = data.slice(Math.max(0, end - 7), end);
+    buckets.unshift({
+      start: rows[0].day,
+      end: rows[rows.length - 1].day,
+      normal_hours: rows.reduce((sum, row) => sum + row.normal_hours, 0),
+      ot_hours: rows.reduce((sum, row) => sum + row.ot_hours, 0),
+    });
+  }
+
   const innerW = Math.max(1, width - PAD.left - PAD.right);
   const innerH = HEIGHT - PAD.top - PAD.bottom;
-  const n = data.length;
-
-  const peak = Math.max(1, ...data.map((d) => d.normal_hours + d.ot_hours));
-  const ticks = niceTicks(peak);
-  const yMax = ticks[ticks.length - 1];
-
+  const n = buckets.length;
+  const peak = Math.max(1, ...buckets.map((d) => d.normal_hours + d.ot_hours));
+  const rawTicks = niceTicks(peak);
+  const middleTick = Math.floor((rawTicks.length - 1) / 2);
+  const ticks = rawTicks.filter(
+    (_, index) => index === 0 || index === middleTick || index === rawTicks.length - 1,
+  );
+  const yMax = rawTicks[rawTicks.length - 1];
   const band = innerW / n;
-  const colW = Math.max(2, Math.min(band - 2, 22));
+  const colW = Math.max(12, Math.min(band * 0.42, 34));
   const cx = (i: number) => PAD.left + band * (i + 0.5);
   const y = (v: number) => PAD.top + innerH - (v / yMax) * innerH;
   const h = (v: number) => (v / yMax) * innerH;
-
-  // Thin labels out by available width — never let two dates collide.
-  const every = Math.max(1, Math.ceil(n / Math.max(2, Math.floor(innerW / 74))));
 
   function pick(e: PointerEvent<SVGSVGElement>) {
     const rect = e.currentTarget.getBoundingClientRect();
@@ -61,7 +73,7 @@ export function StackedHoursChart({ data }: { data: OtDayRow[] }) {
     setActive((prev) => Math.min(n - 1, Math.max(0, (prev ?? 0) + step)));
   }
 
-  const point = active === null ? null : data[active];
+  const point = active === null ? null : buckets[active];
   const tipX = active === null ? 0 : Math.min(Math.max(cx(active), 84), Math.max(84, width - 84));
 
   return (
@@ -69,7 +81,7 @@ export function StackedHoursChart({ data }: { data: OtDayRow[] }) {
       <div className="chart-legend">
         <span className="legend-item">
           <span className="legend-swatch" style={{ background: NORMAL }} aria-hidden="true" />
-          Normal hours
+          Normal
         </span>
         <span className="legend-item">
           <span className="legend-swatch" style={{ background: OT }} aria-hidden="true" />
@@ -82,7 +94,7 @@ export function StackedHoursChart({ data }: { data: OtDayRow[] }) {
         ref={wrapRef}
         tabIndex={0}
         role="group"
-        aria-label="Normal and overtime hours per day. Use the left and right arrow keys to read each day."
+        aria-label="Normal and overtime hours by week. Use the left and right arrow keys to read each period."
         onKeyDown={onKeyDown}
         onBlur={() => setActive(null)}
       >
@@ -93,30 +105,28 @@ export function StackedHoursChart({ data }: { data: OtDayRow[] }) {
           onPointerMove={pick}
           onPointerLeave={() => setActive(null)}
         >
-          <title>Normal and overtime hours per day over the selected window</title>
+          <title>Normal and overtime hours by week over the selected window</title>
 
-          {ticks.map((t) => (
-            <g key={t}>
-              <line className="grid-line" x1={PAD.left} x2={PAD.left + innerW} y1={y(t)} y2={y(t)} />
-              <text className="axis-label" x={PAD.left - 8} y={y(t) + 4} textAnchor="end">
-                {t}
+          {ticks.map((tick) => (
+            <g key={tick}>
+              <line className="grid-line" x1={PAD.left} x2={PAD.left + innerW} y1={y(tick)} y2={y(tick)} />
+              <text className="axis-label" x={PAD.left - 7} y={y(tick) + 3} textAnchor="end">
+                {tick}
               </text>
             </g>
           ))}
 
-          {data.map((d, i) =>
-            i % every === 0 ? (
-              <text
-                key={d.day}
-                className="axis-label"
-                x={cx(i)}
-                y={HEIGHT - 8}
-                textAnchor={i === 0 ? "start" : i >= n - every ? "end" : "middle"}
-              >
-                {formatDayShort(d.day)}
-              </text>
-            ) : null,
-          )}
+          {buckets.map((bucket, index) => (
+            <text
+              key={bucket.end}
+              className="axis-label"
+              x={cx(index)}
+              y={HEIGHT - 8}
+              textAnchor="middle"
+            >
+              {formatDayShort(bucket.end)}
+            </text>
+          ))}
 
           {active !== null && (
             <rect
@@ -129,21 +139,23 @@ export function StackedHoursChart({ data }: { data: OtDayRow[] }) {
           )}
 
           <g className="col-rise">
-            {data.map((d, i) => (
-              <g key={d.day}>
+            {buckets.map((bucket, index) => (
+              <g key={bucket.end}>
                 <rect
-                  x={cx(i) - colW / 2}
-                  y={y(d.normal_hours)}
+                  x={cx(index) - colW / 2}
+                  y={y(bucket.normal_hours)}
                   width={colW}
-                  height={Math.max(0, h(d.normal_hours))}
+                  height={Math.max(0, h(bucket.normal_hours))}
                   fill={NORMAL}
+                  rx="3"
                 />
                 <rect
-                  x={cx(i) - colW / 2}
-                  y={y(d.normal_hours + d.ot_hours)}
+                  x={cx(index) - colW / 2}
+                  y={y(bucket.normal_hours + bucket.ot_hours)}
                   width={colW}
-                  height={Math.max(0, h(d.ot_hours))}
+                  height={Math.max(0, h(bucket.ot_hours))}
                   fill={OT}
+                  rx="3"
                 />
               </g>
             ))}
@@ -152,7 +164,7 @@ export function StackedHoursChart({ data }: { data: OtDayRow[] }) {
 
         {point && (
           <div className="chart-tip" style={{ left: tipX }}>
-            <p className="tip-day">{formatDay(point.day)}</p>
+            <p className="tip-day">{formatDayShort(point.start)} to {formatDayShort(point.end)}</p>
             <p className="tip-row tnum">
               <span className="legend-swatch" style={{ background: NORMAL }} aria-hidden="true" />
               {formatHours(point.normal_hours)}h normal
@@ -166,20 +178,20 @@ export function StackedHoursChart({ data }: { data: OtDayRow[] }) {
       </div>
 
       <table className="sr-only">
-        <caption>Normal and overtime hours per day</caption>
+        <caption>Normal and overtime hours by weekly period</caption>
         <thead>
           <tr>
-            <th scope="col">Day</th>
+            <th scope="col">Period</th>
             <th scope="col">Normal hours</th>
             <th scope="col">Overtime hours</th>
           </tr>
         </thead>
         <tbody>
-          {data.map((d) => (
-            <tr key={d.day}>
-              <th scope="row">{formatDay(d.day)}</th>
-              <td>{formatHours(d.normal_hours)}</td>
-              <td>{formatHours(d.ot_hours)}</td>
+          {buckets.map((bucket) => (
+            <tr key={bucket.end}>
+              <th scope="row">{formatDay(bucket.start)} to {formatDay(bucket.end)}</th>
+              <td>{formatHours(bucket.normal_hours)}</td>
+              <td>{formatHours(bucket.ot_hours)}</td>
             </tr>
           ))}
         </tbody>

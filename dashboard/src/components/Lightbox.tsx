@@ -1,6 +1,7 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useFocusTrap } from "../lib/useFocusTrap";
 import { mediaLabel } from "../lib/reports";
+import { getSignedUrls } from "../lib/signedUrls";
 import type { ReportMedia } from "../lib/types";
 
 export interface LightboxItem {
@@ -32,6 +33,24 @@ export function Lightbox({ items, index, onIndex, onClose }: Props) {
   const current = items[index];
   const hasPrev = index > 0;
   const hasNext = index < items.length - 1;
+
+  // Grids are served resized copies; full resolution is fetched only for the
+  // frame actually being looked at. The thumbnail stays on screen until the
+  // original arrives, so opening never flashes empty.
+  const [fullUrls, setFullUrls] = useState<Record<string, string>>({});
+  const path = current?.media.storage_path;
+  useEffect(() => {
+    if (!path || fullUrls[path]) return;
+    let alive = true;
+    void getSignedUrls([path]).then((map) => {
+      if (alive) setFullUrls((prev) => ({ ...prev, ...map }));
+    });
+    return () => {
+      alive = false;
+    };
+  }, [path, fullUrls]);
+
+  const shownUrl = (path && fullUrls[path]) || current?.url || null;
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -87,10 +106,10 @@ export function Lightbox({ items, index, onIndex, onClose }: Props) {
           {index + 1} / {items.length}
         </span>
         <span style={{ flex: 1 }} />
-        {current.url && (
+        {shownUrl && (
           <a
             className="btn btn-on-dark"
-            href={downloadHref(current.url)}
+            href={downloadHref(shownUrl)}
             download={name}
             target="_blank"
             rel="noreferrer"
@@ -118,12 +137,12 @@ export function Lightbox({ items, index, onIndex, onClose }: Props) {
         </button>
 
         <figure key={current.media.id}>
-          {!current.url ? (
+          {!shownUrl ? (
             <div className="lightbox-doc">This file could not be loaded.</div>
           ) : current.media.media_type === "photo" ? (
-            <img src={current.url} alt={current.alt} />
+            <img src={shownUrl} alt={current.alt} />
           ) : current.media.media_type === "video" ? (
-            <video src={current.url} controls autoPlay playsInline />
+            <video src={shownUrl} controls autoPlay playsInline />
           ) : (
             <div className="lightbox-doc">
               <p className="truncate" title={name}>
