@@ -1420,3 +1420,79 @@ table.data th {
     aspect-ratio: 16 / 8;
   }
 }
+
+/* ---------- focus briefing ---------- */
+.command-focus {
+  /* Its own full-width row: the briefing reads as prose and would be cramped
+     in the narrow column beside the map. */
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+}
+.command-focus .command-panel-title h3 {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+/* The briefing is prose, so it gets reading measure rather than the dense
+   tabular treatment the rest of the board uses. */
+.focus-summary {
+  max-width: 68ch;
+  color: var(--ink-2);
+  font-size: 0.95rem;
+  line-height: 1.55;
+}
+.focus-list {
+  display: grid;
+  gap: 8px;
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.focus-item {
+  padding: 11px 14px 12px;
+  border: 1px solid oklch(0.86 0.04 255 / 0.68);
+  border-radius: 12px;
+  background: oklch(0.99 0.01 250 / 0.42);
+  box-shadow: inset 0 1px 0 oklch(0.99 0.01 250 / 0.7);
+}
+.focus-item-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.focus-item-head strong {
+  color: var(--ink);
+  font-size: 0.95rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+.focus-item p {
+  margin: 5px 0 0;
+  max-width: 72ch;
+  color: var(--ink-3);
+  font-size: 0.87rem;
+  line-height: 1.5;
+}
+.focus-empty {
+  color: var(--ink-3);
+  font-size: 0.9rem;
+}
+.focus-error {
+  padding: 10px 13px;
+  border: 1px solid oklch(0.72 0.17 25 / 0.35);
+  border-radius: 10px;
+  background: oklch(0.72 0.17 25 / 0.07);
+  color: var(--ink-2);
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+@media (max-width: 899px) {
+  .command-focus .command-panel-head {
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+}

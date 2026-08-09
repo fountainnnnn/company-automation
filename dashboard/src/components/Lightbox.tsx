@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useFocusTrap } from "../lib/useFocusTrap";
 import { mediaLabel } from "../lib/reports";
 import { getSignedUrls } from "../lib/signedUrls";
@@ -15,6 +16,15 @@ interface Props {
   index: number;
   onIndex: (next: number) => void;
   onClose: () => void;
+}
+
+/**
+ * A photo sent through Telegram as a *file* (send-without-compression) arrives
+ * as a document that happens to be an image. It is still a picture and should
+ * be shown as one.
+ */
+export function isImage(media: ReportMedia): boolean {
+  return media.media_type === "photo" || (media.mime_type ?? "").startsWith("image/");
 }
 
 function downloadHref(url: string): string {
@@ -78,7 +88,7 @@ export function Lightbox({ items, index, onIndex, onClose }: Props) {
 
   const name = mediaLabel(current.media);
 
-  return (
+  return createPortal(
     <div
       className="lightbox"
       role="dialog"
@@ -86,6 +96,11 @@ export function Lightbox({ items, index, onIndex, onClose }: Props) {
       aria-label={`Media viewer, ${index + 1} of ${items.length}`}
       ref={ref}
       tabIndex={-1}
+      onMouseDown={(e) => {
+        // Only a click on the backdrop itself closes — not one that started
+        // inside the panel and drifted out (drag-selecting, flicking an image).
+        if (e.target === e.currentTarget) onClose();
+      }}
       onTouchStart={(e) => {
         touchX.current = e.touches[0].clientX;
       }}
@@ -98,76 +113,79 @@ export function Lightbox({ items, index, onIndex, onClose }: Props) {
         if (dx < -60 && hasNext) onIndex(index + 1);
       }}
     >
-      <div className="lightbox-bar">
-        <span className="title truncate" title={name}>
-          {name}
-        </span>
-        <span className="tnum" style={{ color: "#fff", opacity: 0.7, flex: "none" }}>
-          {index + 1} / {items.length}
-        </span>
-        <span style={{ flex: 1 }} />
-        {shownUrl && (
-          <a
-            className="btn btn-on-dark"
-            href={downloadHref(shownUrl)}
-            download={name}
-            target="_blank"
-            rel="noreferrer"
-          >
-            Download
-          </a>
-        )}
-        <button className="btn btn-on-dark" ref={closeRef} onClick={onClose}>
-          Close
-        </button>
-      </div>
-
-      <div className="lightbox-stage">
-        <button
-          className="nav-arrow"
-          ref={prevRef}
-          onFocus={() => {
-            lastArrow.current = "prev";
-          }}
-          onClick={() => onIndex(index - 1)}
-          disabled={!hasPrev}
-          aria-label="Previous media"
-        >
-          ‹
-        </button>
-
-        <figure key={current.media.id}>
-          {!shownUrl ? (
-            <div className="lightbox-doc">This file could not be loaded.</div>
-          ) : current.media.media_type === "photo" ? (
-            <img src={shownUrl} alt={current.alt} />
-          ) : current.media.media_type === "video" ? (
-            <video src={shownUrl} controls autoPlay playsInline />
-          ) : (
-            <div className="lightbox-doc">
-              <p className="truncate" title={name}>
-                {name}
-              </p>
-              <p style={{ opacity: 0.7, fontSize: "0.85rem", marginTop: 8 }}>
-                Use Download to open this document.
-              </p>
-            </div>
+      <div className="lightbox-panel">
+        <div className="lightbox-bar">
+          <span className="title truncate" title={name}>
+            {name}
+          </span>
+          <span className="tnum" style={{ color: "#fff", opacity: 0.7, flex: "none" }}>
+            {index + 1} / {items.length}
+          </span>
+          <span style={{ flex: 1 }} />
+          {shownUrl && (
+            <a
+              className="btn btn-on-dark"
+              href={downloadHref(shownUrl)}
+              download={name}
+              target="_blank"
+              rel="noreferrer"
+            >
+              Download
+            </a>
           )}
-        </figure>
+          <button className="btn btn-on-dark" ref={closeRef} onClick={onClose}>
+            Close
+          </button>
+        </div>
 
-        <button
-          className="nav-arrow"
-          ref={nextRef}
-          onFocus={() => {
-            lastArrow.current = "next";
-          }}
-          onClick={() => onIndex(index + 1)}
-          disabled={!hasNext}
-          aria-label="Next media"
-        >
-          ›
-        </button>
+        <div className="lightbox-stage">
+          <button
+            className="nav-arrow"
+            ref={prevRef}
+            onFocus={() => {
+              lastArrow.current = "prev";
+            }}
+            onClick={() => onIndex(index - 1)}
+            disabled={!hasPrev}
+            aria-label="Previous media"
+          >
+            ‹
+          </button>
+
+          <figure key={current.media.id}>
+            {!shownUrl ? (
+              <div className="lightbox-doc">This file could not be loaded.</div>
+            ) : isImage(current.media) ? (
+              <img src={shownUrl} alt={current.alt} />
+            ) : current.media.media_type === "video" ? (
+              <video src={shownUrl} controls autoPlay playsInline />
+            ) : (
+              <div className="lightbox-doc">
+                <p className="truncate" title={name}>
+                  {name}
+                </p>
+                <p style={{ opacity: 0.7, fontSize: "0.85rem", marginTop: 8 }}>
+                  Use Download to open this document.
+                </p>
+              </div>
+            )}
+          </figure>
+
+          <button
+            className="nav-arrow"
+            ref={nextRef}
+            onFocus={() => {
+              lastArrow.current = "next";
+            }}
+            onClick={() => onIndex(index + 1)}
+            disabled={!hasNext}
+            aria-label="Next media"
+          >
+            ›
+          </button>
+        </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

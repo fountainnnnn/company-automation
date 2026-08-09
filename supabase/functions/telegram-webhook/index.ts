@@ -1,4 +1,4 @@
-// Telegram bot webhook — construction-site reporting + attendance.
+// Telegram bot webhook — construction-site reporting.
 //
 // Stateless: every update re-resolves the worker and the chat session from the
 // database. Secrets and settings are cached in module scope for the lifetime of
@@ -7,7 +7,6 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createClient } from "jsr:@supabase/supabase-js@2";
-import { looksLikeTimesheet, type ParsedTimesheet, parseTimesheet } from "./parser.ts";
 
 /**
  * Per-request send queue. A round trip to api.telegram.org costs ~900ms from
@@ -184,16 +183,6 @@ interface ReportNote {
   created_at: string;
 }
 
-interface Attendance {
-  id: number;
-  worker_id: number;
-  project_id: number | null;
-  check_in_at: string;
-  in_lat: number;
-  in_lng: number;
-  flags: string[];
-}
-
 /** Media descriptor; pending items are persisted in the pending_media table. */
 interface MediaDescriptor {
   media_type: "photo" | "video" | "document";
@@ -223,24 +212,15 @@ interface Draft {
   pending_group?: string | null;
   /** Text-only record waiting for its site pick. */
   pending_note?: string;
-  /** Parsed timesheet awaiting confirmation, plus the message it came from. */
-  timesheet?: ParsedTimesheet;
-  timesheet_raw?: string;
 }
 
 type SessionState =
   | "idle"
-  | "awaiting_checkin_location"
-  | "awaiting_checkout_location"
   | "choosing_project_for_media"
   | "adding_note"
   | "editing_note"
   | "typing_date"
-  | "awaiting_record"
-  | "awaiting_timesheet"
-  | "ts_typing_date"
-  | "ts_typing_team"
-  | "ts_typing_loc";
+  | "awaiting_record";
 
 interface Session {
   chat_id: number;
@@ -263,7 +243,6 @@ interface Config {
 
 interface Settings {
   timezone: string;
-  flagDistanceKm: number;
 }
 
 let configPromise: Promise<Config> | null = null;
@@ -305,10 +284,7 @@ async function getSettings(): Promise<Settings> {
   if (settingsCache && Date.now() - settingsCache.at < SETTINGS_TTL_MS) {
     return settingsCache.value;
   }
-  const res = await supabase.from("settings").select("key, value").in("key", [
-    "timezone",
-    "flag_distance_km",
-  ]);
+  const res = await supabase.from("settings").select("key, value").eq("key", "timezone");
   if (res.error) {
     // fall back to the stale value rather than failing the update
     if (settingsCache) return settingsCache.value;
@@ -328,10 +304,8 @@ async function getSettings(): Promise<Settings> {
 function cacheSettings(map: Record<string, unknown> | null | undefined): Settings | null {
   if (!map) return null;
   const tz = map["timezone"];
-  const km = map["flag_distance_km"];
   const value: Settings = {
     timezone: typeof tz === "string" && tz ? tz : "Asia/Singapore",
-    flagDistanceKm: typeof km === "number" && km > 0 ? km : 10,
   };
   settingsCache = { value, at: Date.now() };
   return value;
@@ -475,17 +449,6 @@ function replyTo(
   return send(chatId, text, { reply_parameters: { message_id: messageId }, ...extra });
 }
 
-const LOCATION_KEYBOARD = {
-  keyboard: [
-    [{ text: "📍 Share location", request_location: true }],
-    // A reply keyboard can't carry an inline ❌, and a question with no visible
-    // way out is how people got stuck here — so cancelling gets its own key.
-    [{ text: "❌ Cancel" }],
-  ],
-  one_time_keyboard: true,
-  resize_keyboard: true,
-};
-
 /**
  * The escape hatch every prompt carries. /cancel existed all along but nothing
  * on screen ever said so, which made a mistyped flow feel like a dead end.
@@ -505,33 +468,40 @@ function withMediaCancel(rows: InlineButton[][]): InlineButton[][] {
  */
 const MAIN_KEYBOARD = {
   keyboard: [
-    // site work first — it's the everyday job; attendance is its own thing
-    [{ text: "📷 Send records" }, { text: "📋 Timesheet" }],
-    [{ text: "🕘 Check in" }, { text: "🕔 Check out" }],
+    [{ text: "📷 Send records" }],
     // "My day" is the worker's own read-only view — the half that makes this
     // feel like an application rather than a drop box
-    [{ text: "ℹ️ Status" }, { text: "📄 My day" }],
+    [{ text: "📄 My day" }],
   ],
   resize_keyboard: true,
   is_persistent: true,
 };
+
+/**
+ * Labels from features that no longer exist. A reply keyboard lives in the
+ * worker's Telegram until the bot replaces it, so these keep arriving for a
+ * while after the buttons are gone — and a tapped ghost must never be mistaken
+ * for a description and filed onto an open record.
+ */
+const RETIRED_BUTTONS = new Set([
+  "checkin",
+  "checkout",
+  "status",
+  "timesheet",
+]);
 
 /** Map a tapped button back to the command it stands for. */
 function buttonCommand(text: string): string | null {
   const key = text.replace(/[^a-z]/gi, "").toLowerCase();
   const map: Record<string, string> = {
     sendrecords: "send",
-    checkin: "checkin",
-    checkout: "checkout",
-    timesheet: "timesheet",
-    status: "status",
     myday: "today",
-    // the location prompt's reply-keyboard cancel — its only way out
     cancel: "cancel",
     // /help stays a command even though the button gave up its slot
     help: "help",
   };
-  return map[key] ?? null;
+  if (map[key]) return map[key];
+  return RETIRED_BUTTONS.has(key) ? "retired" : null;
 }
 
 // ---------------------------------------------------------------- time helpers
@@ -585,24 +555,6 @@ async function localDateOf(when: Date | string): Promise<string> {
 /** Today (or today minus `daysBack`) as YYYY-MM-DD in the configured timezone. */
 function localDate(daysBack = 0): Promise<string> {
   return localDateOf(new Date(Date.now() - daysBack * 86_400_000));
-}
-
-function fmtDuration(ms: number): string {
-  const totalMinutes = Math.max(0, Math.round(ms / 60_000));
-  const h = Math.floor(totalMinutes / 60);
-  const m = totalMinutes % 60;
-  return h > 0 ? `${h}h ${m}m` : `${m}m`;
-}
-
-function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
-  const R = 6_371_000;
-  const toRad = (v: number) => (v * Math.PI) / 180;
-  const dLat = toRad(lat2 - lat1);
-  const dLng = toRad(lng2 - lng1);
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
-  return Math.round(2 * R * Math.asin(Math.min(1, Math.sqrt(a))));
 }
 
 // ---------------------------------------------------------------- session
@@ -707,10 +659,15 @@ interface BotContext {
   projects: Project[];
 }
 
-async function loadBotContext(chatId: number, telegramUserId: number): Promise<BotContext> {
+async function loadBotContext(
+  chatId: number,
+  telegramUserId: number,
+  username?: string | null,
+): Promise<BotContext> {
   const { data, error } = await supabase.rpc("bot_context", {
     p_chat_id: chatId,
     p_tg_user_id: telegramUserId,
+    p_username: username ?? null,
   });
   if (error) throw error;
 
@@ -801,20 +758,6 @@ async function listProjects(workerId: number): Promise<Project[]> {
   return rows;
 }
 
-async function openAttendance(workerId: number): Promise<Attendance | null> {
-  // "open" = not checked out and not administratively closed by the no_checkout
-  // sweep — review flags (far_apart etc.) never hide a live shift from the bot.
-  const { data, error } = await supabase
-    .from("attendance")
-    .select("id, worker_id, project_id, check_in_at, in_lat, in_lng, flags")
-    .eq("worker_id", workerId)
-    .is("check_out_at", null)
-    .not("flags", "cs", "{no_checkout}")
-    .maybeSingle();
-  if (error) throw error;
-  return (data as Attendance) ?? null;
-}
-
 async function projectKeyboard(
   workerId: number,
   prefix: string,
@@ -897,18 +840,8 @@ const HELP_TEXT = [
   "I'll ask which site it's for. A caption becomes the note.",
   "The record stays open: keep adding, then tap ✅ Done.",
   "",
-  "🕘 ATTENDANCE",
-  "Check in / Check out share your location to log your hours.",
-  "This is separate — you don't need to check in to send photos.",
-  "",
-  "📋 TIMESHEET",
-  "Paste the day's crew list, e.g.",
-  "03/08 Team 2 Tuas",
-  "(W101 - 8)",
-  "(W104 - MC)",
-  "",
   "📄 MY DAY",
-  "Everything you've logged today, with your hours. Read-only.",
+  "Every record you've filed today. Read-only.",
   "",
   "Use the buttons below — no commands to remember.",
 ].join("\n");
@@ -1468,7 +1401,7 @@ async function handleMessage(message: TgMessage): Promise<void> {
 
   const chatId = message.chat.id;
   // worker + session + group link + settings + open record, in one round trip
-  const ctx = await loadBotContext(chatId, from.id);
+  const ctx = await loadBotContext(chatId, from.id, from.username);
   // A group session is shared by everyone in the chat, so group handling never
   // reads it — only the pieces below are passed through.
   if (group) return handleGroupMessage(message, from, ctx.groupLink, ctx.worker);
@@ -1495,8 +1428,6 @@ async function handleMessage(message: TgMessage): Promise<void> {
   const command = parseCommand(message.text);
   if (command) return handleCommand(command, chatId, worker, session, openReport);
 
-  if (message.location) return handleLocation(chatId, worker, session, message.location);
-
   const media = extractMedia(message);
   if (media) {
     return handleIncomingMedia(chatId, worker, session, media, message.caption ?? null, openReport);
@@ -1514,12 +1445,6 @@ async function handleMessage(message: TgMessage): Promise<void> {
   if (tapped) return handleCommand(tapped, chatId, worker, session, openReport);
 
   switch (session.state) {
-    case "awaiting_checkin_location":
-    case "awaiting_checkout_location":
-      await send(chatId, "Location is required — please tap the 📍 button.", {
-        reply_markup: LOCATION_KEYBOARD,
-      });
-      return;
     case "awaiting_record":
       // no media came — the typed text IS the record
       return startTextRecord(chatId, worker, session, text, openReport);
@@ -1532,18 +1457,7 @@ async function handleMessage(message: TgMessage): Promise<void> {
     case "choosing_project_for_media":
       await send(chatId, "Pick a project from the buttons above first.");
       return;
-    case "awaiting_timesheet":
-      return startTimesheet(chatId, session, text);
-    case "ts_typing_date":
-      return tsTypedDate(chatId, session, text);
-    case "ts_typing_team":
-      return tsTypedTeam(chatId, session, text);
-    case "ts_typing_loc":
-      return tsTypedLocation(chatId, session, text);
     default:
-      // a pasted crew list is a timesheet even without the command — and even
-      // mid-record: a roster is a different document, not a note about one
-      if (looksLikeTimesheet(text)) return startTimesheet(chatId, session, text);
       // anything else typed while a record is open belongs to that record
       if (openReport) return joinOpenRecord(chatId, worker, session, openReport, text);
       await send(chatId, HELP_TEXT);
@@ -1551,50 +1465,19 @@ async function handleMessage(message: TgMessage): Promise<void> {
 }
 
 /**
- * An admin can pre-register someone by @username before that person has ever
- * messaged the bot (Telegram won't resolve a username to an id until then).
- * On first contact we claim that row rather than creating a pending duplicate,
- * so a pre-approved worker is usable immediately.
+ * Nobody registers themselves. Workers exist because an admin created them,
+ * and the bot only ever reads that list — so an unknown sender is told what to
+ * do and nothing is written.
  */
-async function claimPreregistered(from: TgUser): Promise<Worker | null> {
-  if (!from.username) return null;
-
-  const { data, error } = await supabase
-    .from("workers")
-    .update({ telegram_user_id: from.id, telegram_username: from.username })
-    .is("telegram_user_id", null)
-    .ilike("telegram_username", from.username)
-    .select("id, full_name, telegram_user_id, telegram_username, status, default_project_id")
-    .maybeSingle();
-
-  if (error) {
-    console.error("preregistration claim failed", error);
-    return null;
-  }
-  return (data as Worker) ?? null;
-}
-
 async function handleUnregistered(
   chatId: number,
   session: Session,
-  from: TgUser,
+  _from: TgUser,
 ): Promise<void> {
-  const claimed = await claimPreregistered(from);
-  if (claimed) {
-    saveSessionSoon(session, { worker_id: claimed.id, state: "idle", draft: {} });
-    await send(
-      chatId,
-      claimed.status === "active"
-        ? `Welcome, ${claimed.full_name}. Your account is already set up.\n\n${HELP_TEXT}`
-        : `Welcome, ${claimed.full_name}. Your account is not active. Contact your admin.`,
-    );
-    return;
-  }
-
   saveSessionSoon(session, { state: "idle", draft: {} });
   await send(
     chatId,
-    "Your Telegram account is not set up. Ask an admin to add your Telegram username.",
+    "You're not set up to use this bot. Ask your admin to add you, then send any message here.",
   );
 }
 
@@ -1608,8 +1491,7 @@ async function handleUnregistered(
 //     everything it needs comes from the message and from group_links.
 //  2. NEVER ask a question and almost never reply. Receipts are reactions on the
 //     sender's own message; a reply is reserved for the cases where staying
-//     silent would lose work (a failed upload, an unlinked group, a duplicate
-//     timesheet).
+//     silent would lose work (a failed upload, an unlinked group).
 
 /** How long one sender's loose photos keep landing in the same report. */
 const GROUP_REPORT_WINDOW_MS = 60 * 60_000;
@@ -1622,8 +1504,6 @@ const GROUP_HELP = [
   "📷 Photos, videos and files posted here are archived to this group's site — just post, I stay quiet (👍 = saved).",
   "/link to set the site · /unlink to stop · check in/out is personal, DM me.",
 ].join("\n");
-
-const GROUP_DM_ONLY = "Check-in is personal — do it in a DM with me 👉 t.me/CLAutomationBot";
 
 const GROUP_RESEND_WARNING =
   "⚠️ Couldn't save that file — resend it? (Videos over 20 MB are too big for me; send a smaller clip.)";
@@ -1664,9 +1544,8 @@ async function groupLinkKeyboard(): Promise<InlineButton[][] | null> {
  * Resolve only workers provisioned by an admin; group activity never creates
  * users. `known` is what bot_context already found for this Telegram id.
  */
-async function resolveGroupSender(from: TgUser, known: Worker | null): Promise<Worker | null> {
-  const worker = known ?? await claimPreregistered(from);
-  return worker?.status === "active" ? worker : null;
+function resolveGroupSender(_from: TgUser, known: Worker | null): Worker | null {
+  return known?.status === "active" ? known : null;
 }
 
 function handleGroupMessage(
@@ -1681,12 +1560,7 @@ function handleGroupMessage(
   const media = extractMedia(message);
   if (media) return handleGroupMedia(message, from, link, sender, media);
 
-  // Crew chatter is not a report. The one exception is a pasted crew list —
-  // that is a document someone would otherwise have to re-send in a DM.
-  const text = (message.text ?? "").trim();
-  if (link && text && looksLikeTimesheet(text)) {
-    return groupTimesheet(message, from, link, sender, text);
-  }
+  // Crew chatter is not a report.
   return Promise.resolve();
 }
 
@@ -1703,10 +1577,6 @@ async function handleGroupCommand(
       return groupStartLink(message, sender);
     case "unlink":
       return groupUnlink(message, sender, link);
-    case "checkin":
-    case "checkout":
-      await replyTo(chatId, message.message_id, GROUP_DM_ONLY);
-      return;
     case "status":
     case "help":
     case "start":
@@ -1835,7 +1705,7 @@ async function handleGroupMedia(
     return;
   }
 
-  const filer = await resolveGroupSender(from, sender);
+  const filer = resolveGroupSender(from, sender);
   if (!filer) {
     await replyTo(chatId, message.message_id, GROUP_NOT_A_WORKER);
     return;
@@ -1877,77 +1747,6 @@ async function handleGroupMedia(
     return;
   }
   await react(chatId, message.message_id, "👍");
-}
-
-/**
- * A crew list pasted into the group is saved as-is. No confirm card: the card is
- * a private back-and-forth, and in a group it would be answerable by anyone.
- * Corrections happen in a DM, which is what the duplicate reply points at.
- */
-async function groupTimesheet(
-  message: TgMessage,
-  from: TgUser,
-  link: GroupLink,
-  sender: Worker | null,
-  text: string,
-): Promise<void> {
-  const chatId = message.chat.id;
-  const sheet = parseTimesheet(text, await localDate(), await tz());
-  if (sheet.entries.length === 0) return;
-
-  const workDate = sheet.workDate ?? await localDate();
-  const team = sheet.teamNumber ?? "—";
-
-  // Crews re-post the roster as the day evolves (someone left early, a no-show
-  // turned up). The latest list for this site+team+date is the truth — replace
-  // the earlier one instead of refusing the update.
-  const existing = await findExistingTimesheet(workDate, sheet.teamNumber, link.project_id);
-  if (existing) {
-    const del = await supabase.from("timesheets").delete().eq("id", existing.id);
-    if (del.error) throw del.error;
-  }
-
-  const filer = await resolveGroupSender(from, sender);
-  if (!filer) {
-    await replyTo(chatId, message.message_id, GROUP_NOT_A_WORKER);
-    return;
-  }
-  const { data, error } = await supabase
-    .from("timesheets")
-    .insert({
-      work_date: workDate,
-      team_number: sheet.teamNumber,
-      location: sheet.location,
-      project_id: link.project_id,
-      submitted_by: filer.id,
-      raw_text: text.slice(0, 4000),
-    })
-    .select("id")
-    .single();
-  if (error) throw error;
-
-  const rows = sheet.entries.map((e) => ({
-    timesheet_id: data.id,
-    worker_code: e.workerCode,
-    hours: e.hours,
-    absence_reason: e.absenceReason,
-    role: e.role,
-  }));
-  const entriesInsert = await supabase.from("timesheet_entries").insert(rows);
-  if (entriesInsert.error) {
-    await supabase.from("timesheets").delete().eq("id", data.id);
-    throw entriesInsert.error;
-  }
-
-  const lines = [
-    existing
-      ? `♻️ Timesheet updated · ${await fmtDate(workDate)} · Team ${team} · ${rows.length} entries (replaces the earlier list)`
-      : `✅ Timesheet saved · ${await fmtDate(workDate)} · Team ${team} · ${rows.length} entries`,
-  ];
-  if (sheet.unparsed.length > 0) {
-    lines.push(`⚠️ Couldn't read: ${sheet.unparsed.join(" | ").slice(0, 300)}`);
-  }
-  await replyTo(chatId, message.message_id, lines.join("\n"));
 }
 
 /**
@@ -2042,18 +1841,21 @@ async function handleCommand(
     }
     case "send":
       return cmdSend(chatId, session, openReport);
-    case "status":
-      return cmdStatus(chatId, worker, session);
     case "today":
       return cmdToday(chatId, worker);
-    case "checkin":
-      return cmdCheckin(chatId, worker, session);
-    case "checkout":
-      return cmdCheckout(chatId, worker, session);
-    case "timesheet":
-      return cmdTimesheet(chatId, session);
+    case "retired":
+      // Re-sending the keyboard is the actual fix: it replaces the stale one
+      // holding the button they just tapped.
+      await send(
+        chatId,
+        "That's not part of the bot any more — site records only.",
+        { reply_markup: MAIN_KEYBOARD },
+      );
+      return;
     default:
-      await send(chatId, "I don't know that command. Send /help to see what I can do.");
+      await send(chatId, "I don't know that command. Send /help to see what I can do.", {
+        reply_markup: MAIN_KEYBOARD,
+      });
   }
 }
 
@@ -2089,8 +1891,6 @@ async function startTextRecord(
   text: string,
   openReport: Report | null,
 ): Promise<void> {
-  // "Send records" then a pasted crew list is a timesheet, not a note about one.
-  if (looksLikeTimesheet(text)) return startTimesheet(chatId, session, text);
   // a record still open takes the words: one update, not two half ones
   if (openReport) return joinOpenRecord(chatId, worker, session, openReport, text);
 
@@ -2109,55 +1909,6 @@ async function startTextRecord(
   });
 }
 
-async function cmdStatus(chatId: number, worker: Worker, _session: Session): Promise<void> {
-  const open = await openAttendance(worker.id);
-  await send(
-    chatId,
-    open
-      ? `🕘 Checked in since ${await fmtTime(open.check_in_at)}`
-      : "🕘 Not checked in",
-    { reply_markup: MAIN_KEYBOARD },
-  );
-}
-
-/** Newest attendance row, open or closed — `/today` needs the closed one too. */
-async function latestAttendance(
-  workerId: number,
-): Promise<{ check_in_at: string; check_out_at: string | null; flags: string[] | null } | null> {
-  const { data, error } = await supabase
-    .from("attendance")
-    .select("check_in_at, check_out_at, flags")
-    .eq("worker_id", workerId)
-    .order("check_in_at", { ascending: false })
-    .limit(1);
-  if (error) throw error;
-  return (data?.[0] as { check_in_at: string; check_out_at: string | null; flags: string[] | null }) ??
-    null;
-}
-
-/** The attendance line on the day card, in the worker's own words. */
-async function attendanceRows(workerId: number): Promise<[string, string][]> {
-  const att = await latestAttendance(workerId);
-  if (!att || (await localDateOf(att.check_in_at)) !== (await localDate())) {
-    return [["Status", "Not checked in"]];
-  }
-  const rows: [string, string][] = [["Checked in", await fmtTime(att.check_in_at)]];
-  if (att.check_out_at) {
-    const worked = fmtDuration(
-      new Date(att.check_out_at).getTime() - new Date(att.check_in_at).getTime(),
-    );
-    rows.push(["Status", `Checked out ${await fmtTime(att.check_out_at)} · ${worked}`]);
-  } else if ((att.flags ?? []).includes("no_checkout")) {
-    rows.push(["Status", "No check-out recorded"]);
-  } else {
-    rows.push([
-      "Status",
-      `On site (${fmtDuration(Date.now() - new Date(att.check_in_at).getTime())})`,
-    ]);
-  }
-  return rows;
-}
-
 /** How many records the day card lists before it stops. */
 const TODAY_LIST_LIMIT = 8;
 
@@ -2168,17 +1919,14 @@ const TODAY_LIST_LIMIT = 8;
  */
 async function cmdToday(chatId: number, worker: Worker): Promise<void> {
   const today = await localDate();
-  const [reports, attRows] = await Promise.all([
-    supabase
-      .from("reports")
-      .select(
-        "id, job_ref, created_at, projects(code), report_media(media_type), report_notes(body, created_at)",
-      )
-      .eq("worker_id", worker.id)
-      .eq("report_date", today)
-      .order("created_at", { ascending: false }),
-    attendanceRows(worker.id),
-  ]);
+  const reports = await supabase
+    .from("reports")
+    .select(
+      "id, job_ref, created_at, projects(code), report_media(media_type), report_notes(body, created_at)",
+    )
+    .eq("worker_id", worker.id)
+    .eq("report_date", today)
+    .order("created_at", { ascending: false });
   if (reports.error) throw reports.error;
 
   const rows = ((reports.data ?? []) as {
@@ -2198,7 +1946,7 @@ async function cmdToday(chatId: number, worker: Worker): Promise<void> {
   if (rows.length === 0) {
     await send(
       chatId,
-      card(title, attRows, "Nothing logged yet. Tap 📷 Send records when you've got something."),
+      card(title, [["Records", "0"]], "Nothing logged yet. Tap 📷 Send records when you've got something."),
       { parse_mode: "HTML", reply_markup: MAIN_KEYBOARD },
     );
     return;
@@ -2211,7 +1959,6 @@ async function cmdToday(chatId: number, worker: Worker): Promise<void> {
     allTypes.length === photos
       ? ["Photos", String(photos)]
       : ["Files", String(allTypes.length)],
-    ...attRows,
   ];
 
   const listed = rows.slice(0, TODAY_LIST_LIMIT).map((r) => {
@@ -2235,168 +1982,6 @@ async function cmdToday(chatId: number, worker: Worker): Promise<void> {
     `${card(title, summary)}\nRecords today:\n${listed.join("\n")}`,
     { parse_mode: "HTML", reply_markup: MAIN_KEYBOARD },
   );
-}
-
-async function cmdCheckin(chatId: number, worker: Worker, session: Session): Promise<void> {
-  const open = await openAttendance(worker.id);
-  if (open) {
-    await send(
-      chatId,
-      `Already checked in since ${await fmtTime(open.check_in_at)}. Use /checkout first.`,
-    );
-    return;
-  }
-  saveSessionSoon(session, { state: "awaiting_checkin_location" });
-  await send(chatId, "Tap to share your location — required to check in.", {
-    reply_markup: LOCATION_KEYBOARD,
-  });
-}
-
-async function cmdCheckout(chatId: number, worker: Worker, session: Session): Promise<void> {
-  const open = await openAttendance(worker.id);
-  if (!open) {
-    await send(chatId, "You're not checked in. Use /checkin.");
-    return;
-  }
-  saveSessionSoon(session, { state: "awaiting_checkout_location" });
-  await send(chatId, "Tap to share your location — required to check out.", {
-    reply_markup: LOCATION_KEYBOARD,
-  });
-}
-
-// ---------------------------------------------------------------- attendance
-
-async function handleLocation(
-  chatId: number,
-  worker: Worker,
-  session: Session,
-  location: TgLocation,
-): Promise<void> {
-  if (session.state === "awaiting_checkin_location") return doCheckin(chatId, worker, session, location);
-  if (session.state === "awaiting_checkout_location") return doCheckout(chatId, worker, session, location);
-  await send(chatId, "Use /checkin or /checkout first.", { reply_markup: MAIN_KEYBOARD });
-}
-
-/** Registered site within 1.5 km of a point, nearest first. */
-async function nearestSite(lat: number, lng: number): Promise<Project | null> {
-  const { data, error } = await supabase
-    .from("projects")
-    .select("id, code, name, site_lat, site_lng")
-    .eq("status", "active")
-    .not("site_lat", "is", null);
-  if (error || !data) return null;
-
-  let best: Project | null = null;
-  let bestMetres = 1500;
-  for (const p of data as (Project & { site_lat: number; site_lng: number })[]) {
-    const m = haversineMeters(lat, lng, p.site_lat, p.site_lng);
-    if (m < bestMetres) {
-      bestMetres = m;
-      best = { id: p.id, code: p.code, name: p.name };
-    }
-  }
-  return best;
-}
-
-async function doCheckin(
-  chatId: number,
-  worker: Worker,
-  session: Session,
-  location: TgLocation,
-): Promise<void> {
-  const existing = await openAttendance(worker.id);
-  if (existing) {
-    saveSessionSoon(session, { state: "idle" });
-    await send(
-      chatId,
-      `Already checked in since ${await fmtTime(existing.check_in_at)}. Use /checkout first.`,
-      { reply_markup: MAIN_KEYBOARD },
-    );
-    return;
-  }
-
-  // The GPS names the site for THIS attendance row only. It deliberately does
-  // not touch where photos file: a worker may shoot a delivery, a supplier yard
-  // or another crew's defect from anywhere, so the filing site stays their own
-  // explicit choice (📁 Switch site) at all times.
-  const nearest = await nearestSite(location.latitude, location.longitude);
-
-  const { data, error } = await supabase
-    .from("attendance")
-    .insert({
-      worker_id: worker.id,
-      project_id: nearest?.id ?? null,
-      in_lat: location.latitude,
-      in_lng: location.longitude,
-    })
-    .select("id, check_in_at")
-    .single();
-  if (error) throw error;
-
-  saveSessionSoon(session, { state: "idle" });
-
-  // Attendance only. Where photos file is a separate, worker-chosen setting and
-  // is deliberately not mentioned here — conflating the two is what made people
-  // think they had to check in before they could send anything.
-  const rows: [string, string][] = [["Time", await fmtTime(data.check_in_at)]];
-  if (nearest) rows.push(["Location", `${nearest.code} — ${nearest.name}`]);
-  await send(chatId, card("✅ Checked in", rows), {
-    parse_mode: "HTML",
-    reply_markup: MAIN_KEYBOARD,
-  });
-}
-
-async function doCheckout(
-  chatId: number,
-  worker: Worker,
-  session: Session,
-  location: TgLocation,
-): Promise<void> {
-  const open = await openAttendance(worker.id);
-  if (!open) {
-    saveSessionSoon(session, { state: "idle" });
-    await send(chatId, "You're not checked in. Use /checkin.", { reply_markup: MAIN_KEYBOARD });
-    return;
-  }
-
-  const { flagDistanceKm } = await getSettings();
-  const distance = haversineMeters(open.in_lat, open.in_lng, location.latitude, location.longitude);
-  const farApart = distance >= flagDistanceKm * 1000;
-  const checkOutAt = new Date();
-
-  const { error } = await supabase
-    .from("attendance")
-    .update({
-      check_out_at: checkOutAt.toISOString(),
-      out_lat: location.latitude,
-      out_lng: location.longitude,
-      distance_m: distance,
-      ...(farApart
-        ? {
-          flags: Array.from(new Set([...(open.flags ?? []), "far_apart"])),
-          review_status: "pending",
-        }
-        : {}),
-    })
-    .eq("id", open.id);
-  if (error) throw error;
-
-  saveSessionSoon(session, { state: "idle" });
-
-  const worked = fmtDuration(checkOutAt.getTime() - new Date(open.check_in_at).getTime());
-  const rows: [string, string][] = [
-    ["Time", await fmtTime(checkOutAt)],
-    ["Duration", worked],
-  ];
-  // States the distance, never the review flag: whether a shift gets looked at
-  // is an admin matter, and telling the worker turns it into an accusation.
-  const footer = farApart
-    ? `Logged ${(distance / 1000).toFixed(1)} km from where you checked in.`
-    : undefined;
-  await send(chatId, card("✅ Checked out", rows, footer), {
-    parse_mode: "HTML",
-    reply_markup: MAIN_KEYBOARD,
-  });
 }
 
 // ---------------------------------------------------------------- media intake
@@ -2882,319 +2467,6 @@ async function saveDateFromText(
   if (fromReview) await showReviewCard(chatId, cardId, session, reportId);
 }
 
-// ---------------------------------------------------------------- timesheets
-
-const TIMESHEET_PROMPT = [
-  "Send the day's list — one line per worker.",
-  "",
-  "12/08 Team 3 Jurong",
-  "101 - 8",
-  "102 - 8.5",
-  "103 - MC",
-  "",
-  "I'll show you what I read before anything is saved.",
-].join("\n");
-
-const TIMESHEET_GONE = "That timesheet is no longer open. Send the list again.";
-
-async function cmdTimesheet(chatId: number, session: Session): Promise<void> {
-  saveSessionSoon(session, { state: "awaiting_timesheet" });
-  await send(chatId, TIMESHEET_PROMPT, { reply_markup: CANCEL_MARKUP });
-}
-
-function timesheetButtons(): InlineButton[][] {
-  return [
-    [{ text: "✅ Save", callback_data: "ts:save" }],
-    [
-      { text: "📅 Change date", callback_data: "ts:date" },
-      { text: "👥 Change team", callback_data: "ts:team" },
-    ],
-    [
-      { text: "📍 Change location", callback_data: "ts:loc" },
-      { text: "✖️ Discard", callback_data: "ts:x" },
-    ],
-  ];
-}
-
-function entryCell(entry: ParsedTimesheet["entries"][number]): string {
-  const value = entry.hours !== null ? `${entry.hours}h` : entry.absenceReason ?? "?";
-  const role = entry.role === "worker" ? "" : ` (${entry.role})`;
-  return `${entry.workerCode.padEnd(6)}${value}${role}`;
-}
-
-async function timesheetCard(sheet: ParsedTimesheet): Promise<string> {
-  const assumed = sheet.workDate === null;
-  const workDate = sheet.workDate ?? await localDate();
-
-  const hours = sheet.entries.reduce((sum, e) => sum + (e.hours ?? 0), 0);
-  const absent = sheet.entries.filter((e) => e.absenceReason !== null).length;
-
-  const summary: [string, string][] = [
-    ["Date", `${await fmtDateFull(workDate)}${assumed ? " (assumed today)" : ""}`],
-    ["Team", sheet.teamNumber ? `Team ${sheet.teamNumber}` : "—"],
-  ];
-  if (sheet.location) summary.push(["Location", sheet.location]);
-  summary.push(
-    ["Workers", String(sheet.entries.length)],
-    ["Hours", `${Math.round(hours * 10) / 10} h`],
-    ["Absent", String(absent)],
-  );
-
-  const lines = [card("📋 Timesheet — check it over", summary)];
-
-  // the roster itself goes in a <pre> block: Telegram renders it monospaced, so
-  // the code/hours columns line up instead of drifting in a proportional font
-  const rows: string[] = [];
-  for (let i = 0; i < sheet.entries.length; i += 2) {
-    const left = entryCell(sheet.entries[i]);
-    const right = sheet.entries[i + 1] ? entryCell(sheet.entries[i + 1]) : "";
-    rows.push(right ? `${left.padEnd(18)}${right}` : left);
-  }
-  lines.push(`<pre>${esc(rows.join("\n"))}</pre>`);
-
-  if (sheet.unparsed.length > 0) {
-    lines.push(
-      "⚠️ Couldn't read:",
-      `<pre>${esc(sheet.unparsed.join("\n"))}</pre>`,
-    );
-  }
-  return lines.join("\n");
-}
-
-async function sendTimesheetCard(chatId: number, sheet: ParsedTimesheet): Promise<void> {
-  await send(chatId, await timesheetCard(sheet), {
-    parse_mode: "HTML",
-    reply_markup: { inline_keyboard: timesheetButtons() },
-  });
-}
-
-async function startTimesheet(chatId: number, session: Session, text: string): Promise<void> {
-  const sheet = parseTimesheet(text, await localDate(), await tz());
-
-  if (sheet.entries.length === 0) {
-    saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
-    await send(chatId, "I couldn't find any worker lines in that.\n\n" + TIMESHEET_PROMPT);
-    return;
-  }
-
-  saveSessionSoon(session, {
-    state: "idle",
-    draft: { ...session.draft, timesheet: sheet, timesheet_raw: text.slice(0, 4000) },
-  });
-  await sendTimesheetCard(chatId, sheet);
-}
-
-/** Apply an edit to the draft and re-send the confirm card. */
-async function tsPatch(
-  chatId: number,
-  session: Session,
-  patch: Partial<ParsedTimesheet>,
-): Promise<void> {
-  const sheet = session.draft.timesheet;
-  if (!sheet) {
-    saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
-    await send(chatId, TIMESHEET_GONE);
-    return;
-  }
-  const next = { ...sheet, ...patch };
-  saveSessionSoon(session, {
-    state: "idle",
-    draft: { ...session.draft, timesheet: next },
-  });
-  await sendTimesheetCard(chatId, next);
-}
-
-async function tsTypedDate(chatId: number, session: Session, text: string): Promise<void> {
-  const parsed = parseDate(text);
-  if (!parsed) {
-    await send(chatId, "I couldn't read that date. Use 2026-08-03 or 03/08/2026.");
-    return;
-  }
-  await tsPatch(chatId, session, { workDate: parsed });
-}
-
-function tsTypedTeam(chatId: number, session: Session, text: string): Promise<void> {
-  const team = text.trim().replace(/^team\s*/i, "").slice(0, 20).trim();
-  return tsPatch(chatId, session, { teamNumber: team || null });
-}
-
-function tsTypedLocation(chatId: number, session: Session, text: string): Promise<void> {
-  const location = text.trim().slice(0, 80);
-  return tsPatch(chatId, session, { location: location || null });
-}
-
-/** Same (work_date, team_number) already filed — team_number is nullable. */
-async function findExistingTimesheet(
-  workDate: string,
-  teamNumber: string | null,
-  projectId?: number,
-): Promise<{ id: number } | null> {
-  let query = supabase.from("timesheets").select("id").eq("work_date", workDate);
-  query = teamNumber === null
-    ? query.is("team_number", null)
-    : query.eq("team_number", teamNumber);
-  // group flow scopes to its own site so "Team 1" at two sites never collide
-  if (projectId !== undefined) query = query.eq("project_id", projectId);
-  const { data, error } = await query.order("id").limit(1);
-  if (error) throw error;
-  return (data?.[0] as { id: number }) ?? null;
-}
-
-type SaveMode = "new" | "replace" | "add";
-
-async function tsSave(
-  chatId: number,
-  worker: Worker,
-  session: Session,
-  mode: SaveMode,
-): Promise<void> {
-  const sheet = session.draft.timesheet;
-  if (!sheet) {
-    await send(chatId, TIMESHEET_GONE);
-    return;
-  }
-
-  const workDate = sheet.workDate ?? await localDate();
-
-  if (mode !== "add") {
-    const existing = await findExistingTimesheet(workDate, sheet.teamNumber);
-    if (existing && mode === "new") {
-      await send(
-        chatId,
-        `A timesheet for ${await fmtDate(workDate)} · Team ${sheet.teamNumber ?? "—"} already exists.`,
-        {
-          reply_markup: {
-            inline_keyboard: [[
-              { text: "♻️ Replace", callback_data: "ts:repl" },
-              { text: "➕ Add anyway", callback_data: "ts:add" },
-            ]],
-          },
-        },
-      );
-      return;
-    }
-    if (existing && mode === "replace") {
-      // entries cascade with the parent row
-      const { error } = await supabase.from("timesheets").delete().eq("id", existing.id);
-      if (error) throw error;
-    }
-  }
-
-  const projectId = session.draft.project_id ?? worker.default_project_id ?? null;
-  const { data, error } = await supabase
-    .from("timesheets")
-    .insert({
-      work_date: workDate,
-      team_number: sheet.teamNumber,
-      location: sheet.location,
-      project_id: projectId,
-      submitted_by: worker.id,
-      raw_text: session.draft.timesheet_raw ?? null,
-    })
-    .select("id")
-    .single();
-  if (error) throw error;
-
-  // worker_code -> worker_id is resolved by a database trigger
-  const rows = sheet.entries.map((e) => ({
-    timesheet_id: data.id,
-    worker_code: e.workerCode,
-    hours: e.hours,
-    absence_reason: e.absenceReason,
-    role: e.role,
-  }));
-  const entriesInsert = await supabase.from("timesheet_entries").insert(rows);
-  if (entriesInsert.error) {
-    // never leave a headerless timesheet behind
-    await supabase.from("timesheets").delete().eq("id", data.id);
-    throw entriesInsert.error;
-  }
-
-  saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
-  await send(
-    chatId,
-    `✅ Timesheet saved · ${await fmtDate(workDate)} · Team ${sheet.teamNumber ?? "—"} · ${rows.length} entries`,
-  );
-}
-
-async function handleTimesheetCallback(
-  sub: string,
-  chatId: number,
-  messageId: number | undefined,
-  worker: Worker,
-  session: Session,
-): Promise<void> {
-  if (!session.draft.timesheet) {
-    await send(chatId, TIMESHEET_GONE);
-    return;
-  }
-
-  switch (sub) {
-    case "save":
-      return tsSave(chatId, worker, session, "new");
-    case "repl":
-      if (messageId) await editKeyboard(chatId, messageId, []);
-      return tsSave(chatId, worker, session, "replace");
-    case "add":
-      if (messageId) await editKeyboard(chatId, messageId, []);
-      return tsSave(chatId, worker, session, "add");
-    case "date": {
-      const rows: InlineButton[][] = [
-        [
-          { text: "Today", callback_data: "ts:d0" },
-          { text: "Yesterday", callback_data: "ts:d1" },
-        ],
-      ];
-      // picked, never typed — same reasoning as the record date
-      const zone = await tz();
-      let dayRow: InlineButton[] = [];
-      for (let back = 2; back < 7; back++) {
-        const day = await localDate(back);
-        dayRow.push({
-          text: new Intl.DateTimeFormat("en-GB", {
-            timeZone: zone,
-            weekday: "short",
-            day: "numeric",
-          }).format(new Date(`${day}T12:00:00Z`)),
-          callback_data: `ts:d${back}`,
-        });
-        if (dayRow.length === 2) {
-          rows.push(dayRow);
-          dayRow = [];
-        }
-      }
-      if (dayRow.length) rows.push(dayRow);
-      if (messageId) await editKeyboard(chatId, messageId, rows);
-      else await send(chatId, "Which date?", { reply_markup: { inline_keyboard: rows } });
-      return;
-    }
-    case "d0":
-    case "d1":
-    case "d2":
-    case "d3":
-    case "d4":
-    case "d5":
-    case "d6":
-      if (messageId) await editKeyboard(chatId, messageId, []);
-      return tsPatch(chatId, session, { workDate: await localDate(Number(sub.slice(1))) });
-    case "team":
-      saveSessionSoon(session, { state: "ts_typing_team" });
-      await send(chatId, "Send the team, e.g. 3.", { reply_markup: CANCEL_MARKUP });
-      return;
-    case "loc":
-      saveSessionSoon(session, { state: "ts_typing_loc" });
-      await send(chatId, "Send the location.", { reply_markup: CANCEL_MARKUP });
-      return;
-    case "x":
-      if (messageId) await editKeyboard(chatId, messageId, []);
-      saveSessionSoon(session, { state: "idle", draft: resetDraft(session.draft) });
-      await send(chatId, "Discarded.");
-      return;
-    default:
-      console.error("unknown timesheet callback", sub);
-  }
-}
-
 // ---------------------------------------------------------------- callbacks
 
 async function handleCallbackQuery(query: TgCallbackQuery): Promise<void> {
@@ -3212,7 +2484,7 @@ async function handleCallbackQuery(query: TgCallbackQuery): Promise<void> {
   }
 
   // worker + session + open record in one round trip, same as for messages
-  const ctx = await loadBotContext(chatId, query.from.id);
+  const ctx = await loadBotContext(chatId, query.from.id, query.from.username);
   // a group session belongs to nobody in particular — only the worker is used
   if (group) return handleGroupCallback(query, chatId, messageId, ctx.worker);
 
@@ -3293,8 +2565,6 @@ async function handleCallbackQuery(query: TgCallbackQuery): Promise<void> {
       return cbCancelPrompt(chatId, messageId, session, ctx.openReport, false);
     case "cxm":
       return cbCancelPrompt(chatId, messageId, session, ctx.openReport, true);
-    case "ts":
-      return handleTimesheetCallback(parts[1] ?? "", chatId, messageId, worker, session);
     case "pjm":
       return cbPickProjectForMedia(
         chatId,

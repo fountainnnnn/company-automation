@@ -112,7 +112,7 @@ pill radius, muted magnifier icon. Right: circular icon buttons (36px, hairline,
 for notifications etc., then the avatar chip with chevron.
 
 ### Page titles — say what the page is, nothing more
-The title is the **plain name of the page**: `Overview`, `Projects`, `Timesheets`,
+The title is the **plain name of the page**: `Overview`, `Projects`, `Search`,
 `Attendance`, `Workers`, `Settings`. 1.35rem, weight 600, `--dark`.
 
 - No marketing sentences, no full stops, no eyebrow line above it, no

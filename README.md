@@ -1,19 +1,17 @@
-# CL Automation — Site Reporting & Attendance Pipeline
+# CL Automation — Site Reporting Pipeline
 
 Telegram bot (**@CLAutomationBot**) → Supabase (`automation` project) → Web dashboard.
 
-Three things flow through it:
+One thing flows through it:
 
-1. **Site records** — workers send photos/videos/documents with a description; archived by
-   **project + date + worker** and searchable.
-2. **Timesheets** — a supervisor pastes the day's crew list (`date, team, location` then
-   `WorkerID - hours/reason` per line); the bot parses it into rows the office can filter.
-3. **GPS attendance** — `/checkin` and `/checkout` with a mandatory location tap, flagged
-   when the two points are far apart.
+**Site records** — workers send photos, videos, documents or plain text; each is archived by
+**project + date + worker**, described in the worker's own words, and searchable.
 
-Timesheets and GPS attendance are **separate and complementary**: attendance proves an
-individual reached the site, the timesheet is the supervisor's record of the whole crew —
-including no-shows, which produce no GPS event at all.
+The dashboard adds a written **focus briefing** over that archive: what needs attention
+across sites and teams, regenerated on a schedule.
+
+Roster capture, pay calculation and GPS attendance were all removed in August 2026. What
+remains is the archive and the reading of it.
 
 **Status: live.** Webhook registered, schema deployed, dashboard built and tested.
 
@@ -21,10 +19,11 @@ including no-shows, which produce no GPS event at all.
 
 | Piece | Where | Notes |
 |---|---|---|
-| Telegram bot | Supabase Edge Function `telegram-webhook` (v3) | Stateless; webhook mode with secret-token validation |
+| Telegram bot | Supabase Edge Function `telegram-webhook` | Stateless; webhook mode with secret-token validation |
+| Focus briefing | Supabase Edge Function `site-summary` | Server-side model call; key in `app_secrets`, cached, `pg_cron` every 2h |
 | Database + storage | Supabase `odsofzzjniafttbdhtye` (ap-northeast-1) | Postgres + private `site-media` bucket; full RLS |
 | Dashboard | `dashboard/` (Vite + React + TS) | `npm run dev` locally · `npm run build` for deploy |
-| Migrations | `supabase/migrations/*.sql` | Already applied to the live project (5 files) |
+| Migrations | `supabase/migrations/*.sql` | Already applied to the live project |
 | Test harness | `scripts/tg_update.py` | Drives the real webhook with synthetic Telegram updates |
 
 ## Logins & secrets
@@ -44,82 +43,54 @@ rewrite so deep links like `/projects/2` resolve to index.html).
 
 ## How the bot works (worker's view)
 
-1. Message @CLAutomationBot → send your **full name** → wait for admin approval
-   (admin approves + assigns projects in dashboard → Workers).
-2. Send photos/videos/files — saved instantly to your active project
-   (`/project` to switch; captions become searchable notes; buttons on the
-   confirmation let you add a note, change the date, or move project).
-3. `/checkin` and `/checkout` — one tap on the 📍 button each. **No location = no log**
-   (enforced in the schema, not just the flow).
-4. Check-in/out points ≥ **10 km** apart (Settings-tunable) → flagged for admin review.
-   Forgotten checkouts are flagged nightly (rows older than 18 h, so night shifts are safe).
-5. **Group mode** — add @CLAutomationBot to a site's group chat, link it once
+1. An admin adds you in Dashboard → Workers with your **Telegram username**. There is no
+   self-registration — the bot only ever reads that list, and never writes to it. Message
+   the bot and it recognises you immediately.
+2. Send photos/videos/files — or just type what happened. The bot asks which site, then the
+   record stays **open**: keep adding, then tap ✅ Done. Captions become searchable notes,
+   and buttons let you add a note, change the date, or move site.
+3. **Group mode** — add @CLAutomationBot to a site's group chat, link it once
    (`/link` → pick the site), and from then on every photo/video/file posted by
    anyone lands in that site's archive, credited to the sender, acknowledged with
-   a 👍 reaction — the bot never clutters the group with replies. Rosters pasted
-   in the group save directly with a one-line confirmation. Unknown senders are
-   auto-registered as pending workers so no file is ever lost. `/unlink` to detach.
-6. **Timesheets** — paste the day's list (or use `/timesheet`). The bot recognises a roster
-   automatically, e.g.:
-
-   ```
-   03/08 Team 2 Tuas
-   (W101 - 8)
-   (W104 - 8.5)
-   (W107 - 8 driver)
-   (W142 - MC)
-   ```
-
-   It reads the date (day-first), team, location, and each worker's hours **or** reason for
-   no-show, plus `driver`/`welder`/`supervisor` roles. A confirmation card lets you fix the
-   date/team/location before saving. Anything it can't read is shown back under
-   *"Couldn't read"* — never dropped silently.
+   a 👍 reaction — the bot never clutters the group with replies. A sender the admin
+   hasn't added is not recognised and their post is not filed. `/unlink` to detach.
 
 ## Operating notes
 
-- **Approve workers**: Dashboard → Workers → pending card → Approve (+ assign projects, optional default).
-- **Flags queue**: Dashboard → Attendance (admin only). Clear with an optional note.
-  **"View map"** opens an interactive map (Leaflet + OpenStreetMap, no API key) showing the
-  check-in pin, the check-out pin, a dashed connector labelled with the straight-line
-  distance, and the registered site marker — so you can see at a glance whether the worker
-  arrived on site and where they ended up. External map links and raw coordinates stay
-  beneath it as a fallback.
+- **Add workers**: Dashboard → Workers → **Add worker**. The Telegram username is required —
+  it is how the bot recognises them. Assign projects from the same page.
+- **Needs review**: Overview, admin only. Exact counts with a link to where you fix each —
+  workers awaiting approval, records filed with no description, sites silent over 48 hours.
+- **Needs focus**: Overview. A written briefing over the archive, regenerated every two
+  hours by `pg_cron` and skipped entirely when nothing new has been reported. Admins can
+  force one with **Refresh**. The model key lives in `app_secrets`, never in the bundle.
 - **Locale**: the system assumes **Singapore only** — `Asia/Singapore` timezone, day-first
   dates, 24-hour times, metric distances, maps centred on Singapore.
-- **Threshold**: Dashboard → Settings. The bot picks changes up within 60 s.
 - **Purge the test data** created during the build: run `scripts/purge-test-data.sql` in the Supabase SQL editor.
 - **New dashboard users**: invite via Supabase Auth dashboard; a `profiles` row (role `staff`)
   is auto-created — promote to `admin` by updating `profiles.role`.
-- **Worker IDs**: Dashboard → Workers → set each person's **Worker ID** (the code supervisors
-  write in rosters), role and team. A roster naming an unknown ID still saves — the row shows
-  as *"unknown ID"*, and assigning that code later **retroactively links their whole history**.
-- **Timesheets**: Dashboard → Timesheets. Filter by date range, team, role, location, or
-  worker (ID or name); "Roster" on any row shows the supervisor's original message verbatim.
-  Export CSV honours the current filter.
+- **Worker IDs**: Dashboard → Workers → set each person's **Worker ID**, role
+  (`worker`/`driver`/`welder`/`supervisor`) and team. These label who a site record came
+  from; nothing is calculated from them.
 
 ## Known limitations / accepted risks
 
 1. **Real-photo round trip untested**: everything was tested against the live webhook +
    database, but no real Telegram account has sent a photo yet (that requires a human
-   Telegram session). First thing to try after waking up: message the bot, register,
-   approve yourself in the dashboard, send a photo. The `getFile → storage` path has
+   Telegram session). First thing to try: add yourself in Dashboard → Workers with your
+   Telegram username, message the bot, send a photo. The `getFile → storage` path has
    failure reporting either way (never silently claims "Saved").
 2. **Staff API surface**: staff logins can read `workers` rows (incl. telegram usernames)
    and `projects` site coordinates via the REST API even though the UI doesn't show them.
-   Attendance GPS is fully blocked for staff. If this matters, move staff reads to
-   restricted views.
+   If this matters, move staff reads to restricted views.
 3. **Leaked-password protection** (Supabase advisor WARN): enable in Dashboard → Auth →
    Passwords (can't be toggled via API).
 4. Telegram bot API caps downloads at ~20 MB per file — very long videos should be sent
    as documents or split.
-5. **Placeholder data is currently loaded** (6 sites, 9 workers, ~130 reports with 324 real
-   image/PDF files, 219 GPS shifts, 94 timesheets). Clear it with
-   `scripts/purge-test-data.sql` **and** `python scripts/purge_storage.py --yes` — the SQL
-   clears rows, the script clears the uploaded files.
-6. **Timesheet formats deliberately not parsed**: month-name dates (`12 Aug`), time ranges
-   (`8am-5pm` — break deduction is a policy call), worker-ID ranges (`101-105 - 8`), and
-   hours > 24. These land in *"Couldn't read"* for the supervisor to correct rather than
-   being guessed at.
+5. **Placeholder data is currently loaded** (6 sites, 10 workers, ~34 reports, no media).
+   Clear it with `scripts/purge-test-data.sql` **and** `python3 scripts/purge_storage.py --yes`;
+   put it back with `scripts/seed-base-data.sql`. Note the media seeders need the service
+   role key — `storage.objects` has no INSERT policy for authenticated users.
 
 ## Architecture / decision history
 

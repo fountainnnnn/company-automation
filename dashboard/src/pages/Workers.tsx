@@ -1,31 +1,16 @@
 import { useCallback, useEffect, useState } from "react";
 import { supabase } from "../lib/supabase";
-import type { Project, ProjectWorker, TimesheetRole, Worker } from "../lib/types";
+import type { Project, ProjectWorker, Worker, WorkerRole } from "../lib/types";
 import { SectionHeader } from "../components/SectionHeader";
 import { Button } from "../components/Button";
 import { ConfirmDialog, Modal } from "../components/Modal";
 import { EmptyState } from "../components/EmptyState";
 import { SkeletonList } from "../components/Skeleton";
 import { StatusChip } from "../components/StatusChip";
+import { WorkerCreateModal } from "../components/WorkerCreateModal";
 import { useToast } from "../components/Toast";
 
-const WORKER_ROLES: TimesheetRole[] = ["worker", "driver", "welder", "supervisor"];
-
-/** PostgREST can hand a numeric back as a string; every pay field is arithmetic. */
-function normalizeWorker(w: Worker): Worker {
-  return {
-    ...w,
-    hourly_rate:
-      w.hourly_rate === null || w.hourly_rate === undefined ? null : Number(w.hourly_rate),
-    expected_hours: Number(w.expected_hours ?? 8),
-    ot_multiplier: Number(w.ot_multiplier ?? 1.5),
-  };
-}
-
-/** Text for a pay input — an unset rate shows blank, never "0". */
-function rateText(rate: number | null): string {
-  return rate === null ? "" : String(rate);
-}
+const WORKER_ROLES: WorkerRole[] = ["worker", "driver", "welder", "supervisor"];
 
 interface AssignState {
   worker: Worker;
@@ -41,19 +26,19 @@ export function WorkersPage() {
   const [assign, setAssign] = useState<AssignState | null>(null);
   const [disabling, setDisabling] = useState<Worker | null>(null);
   const [busy, setBusy] = useState(false);
+  const [creating, setCreating] = useState(false);
 
   const load = useCallback(async () => {
     const [wk, pj, pw] = await Promise.all([
       supabase
         .from("workers")
         .select("*")
-        .neq("status", "pending")
         .order("created_at", { ascending: false }),
       supabase.from("projects").select("*").eq("status", "active").order("code"),
       supabase.from("project_workers").select("project_id,worker_id"),
     ]);
     if (wk.error) toast.error(wk.error.message);
-    setWorkers(((wk.data ?? []) as Worker[]).map(normalizeWorker));
+    setWorkers((wk.data ?? []) as Worker[]);
     setProjects((pj.data ?? []) as Project[]);
     setLinks((pw.data ?? []) as ProjectWorker[]);
   }, [toast]);
@@ -164,7 +149,22 @@ export function WorkersPage() {
       <SectionHeader
         title="Workers"
         subtitle={workers === null ? undefined : `${rest.length} workers`}
+        actions={
+          <Button variant="primary" onClick={() => setCreating(true)}>
+            Add worker
+          </Button>
+        }
       />
+
+      {creating && (
+        <WorkerCreateModal
+          onClose={() => setCreating(false)}
+          onCreated={(worker) => {
+            setWorkers((prev) => [worker, ...(prev ?? [])]);
+            setCreating(false);
+          }}
+        />
+      )}
 
       <h2 className="sub-head">All workers</h2>
       {workers === null ? (
@@ -172,7 +172,7 @@ export function WorkersPage() {
       ) : rest.length === 0 ? (
         <EmptyState
           title="No workers yet"
-          hint="Workers appear here after an admin adds their details."
+          hint="Add a worker with their Telegram username — that's how the bot recognises them."
         />
       ) : (
         <div className="table-wrap">
@@ -182,9 +182,6 @@ export function WorkersPage() {
               <col className="worker-col-code" />
               <col className="worker-col-role" />
               <col className="worker-col-team" />
-              <col className="worker-col-rate" />
-              <col className="worker-col-hours" />
-              <col className="worker-col-ot" />
               <col className="worker-col-telegram" />
               <col className="worker-col-project" />
               <col className="worker-col-status" />
@@ -196,9 +193,6 @@ export function WorkersPage() {
                 <th>Worker ID</th>
                 <th>Role</th>
                 <th>Team</th>
-                <th className="num">Rate (S$/h)</th>
-                <th className="num">Expected h/day</th>
-                <th className="num">OT ×</th>
                 <th>Telegram</th>
                 <th>Project</th>
                 <th>Status</th>
@@ -242,7 +236,6 @@ export function WorkersPage() {
                           void patchWorker(
                             w.id,
                             { worker_code: next || null },
-                            // Setting the code links this worker's past roster entries.
                             next ? `Worker ID set to ${next}.` : "Worker ID cleared.",
                           ).then((ok) => {
                             // A rejected code must not sit in the field looking saved.
@@ -292,117 +285,6 @@ export function WorkersPage() {
                               next ? `Team set to ${next}.` : "Team cleared.",
                             );
                           }
-                        }}
-                      />
-                    </td>
-                    <td>
-                      <label className="sr-only" htmlFor={`wrate-${w.id}`}>
-                        Hourly rate for {w.full_name}
-                      </label>
-                      <div className="pay-cell">
-                        <input
-                          id={`wrate-${w.id}`}
-                          className="input input-sm tnum"
-                          type="number"
-                          step="0.01"
-                          min={0}
-                          inputMode="decimal"
-                          defaultValue={rateText(w.hourly_rate)}
-                          placeholder="not set"
-                          onBlur={(e) => {
-                            const input = e.target;
-                            const raw = input.value.trim();
-                            const parsed = raw === "" ? 0 : Number(raw);
-                            if (!Number.isFinite(parsed) || parsed < 0) {
-                              toast.error("Rate must be zero or more, or blank for not set.");
-                              input.value = rateText(w.hourly_rate);
-                              return;
-                            }
-                            // Blank and 0 both mean "no rate" — storing 0 would pay nothing
-                            // while still counting the worker as priced.
-                            const next = parsed > 0 ? Math.round(parsed * 100) / 100 : null;
-                            if (next === w.hourly_rate) {
-                              input.value = rateText(next);
-                              return;
-                            }
-                            input.value = rateText(next);
-                            void patchWorker(
-                              w.id,
-                              { hourly_rate: next },
-                              next === null ? "Rate cleared." : `Rate set to S$${next.toFixed(2)}/h.`,
-                            );
-                          }}
-                        />
-                        {w.hourly_rate === null && (
-                          <StatusChip
-                            kind="warn"
-                            label="no rate"
-                            title="Without a rate this worker is left out of payroll totals."
-                          />
-                        )}
-                      </div>
-                    </td>
-                    <td>
-                      <label className="sr-only" htmlFor={`wexp-${w.id}`}>
-                        Expected hours per day for {w.full_name}
-                      </label>
-                      <input
-                        id={`wexp-${w.id}`}
-                        className="input input-sm tnum"
-                        type="number"
-                        step="0.5"
-                        min={1}
-                        max={24}
-                        inputMode="decimal"
-                        defaultValue={String(w.expected_hours)}
-                        onBlur={(e) => {
-                          const input = e.target;
-                          const next = Number(input.value.trim());
-                          if (!Number.isFinite(next) || next < 1 || next > 24) {
-                            toast.error("Expected hours must be between 1 and 24.");
-                            input.value = String(w.expected_hours);
-                            return;
-                          }
-                          const rounded = Math.round(next * 10) / 10;
-                          input.value = String(rounded);
-                          if (rounded === w.expected_hours) return;
-                          void patchWorker(
-                            w.id,
-                            { expected_hours: rounded },
-                            `Expected hours set to ${rounded}.`,
-                          );
-                        }}
-                      />
-                    </td>
-                    <td>
-                      <label className="sr-only" htmlFor={`wot-${w.id}`}>
-                        Overtime multiplier for {w.full_name}
-                      </label>
-                      <input
-                        id={`wot-${w.id}`}
-                        className="input input-sm tnum"
-                        type="number"
-                        step="0.1"
-                        min={1}
-                        max={5}
-                        inputMode="decimal"
-                        defaultValue={String(w.ot_multiplier)}
-                        onBlur={(e) => {
-                          const input = e.target;
-                          const next = Number(input.value.trim());
-                          if (!Number.isFinite(next) || next < 1 || next > 5) {
-                            toast.error("Overtime multiplier must be between 1 and 5.");
-                            input.value = String(w.ot_multiplier);
-                            return;
-                          }
-                          const rounded = Math.round(next * 100) / 100;
-                          input.value = String(rounded);
-                          if (rounded === w.ot_multiplier) return;
-                          void patchWorker(
-                            w.id,
-                            { ot_multiplier: rounded },
-                            `Overtime multiplier set to ×${rounded}.`,
-                          );
                         }}
                       />
                     </td>

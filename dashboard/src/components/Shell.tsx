@@ -1,37 +1,29 @@
 import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../lib/auth";
-import { supabase } from "../lib/supabase";
 import { PageTitleProvider } from "../lib/pageTitle";
 import type { PageTitleState } from "../lib/pageTitle";
 import { useFocusTrap } from "../lib/useFocusTrap";
 import { useMediaQuery } from "../lib/useMediaQuery";
 import {
-  Bell,
   CalendarDays,
-  ClipboardList,
   FolderOpen,
   LayoutDashboard,
   LogOut,
-  MapPin,
   Menu,
   Search,
   Send,
-  Settings,
   Settings2,
   Users,
-  Wallet,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { SkeletonList } from "./Skeleton";
-import type { OverviewStats } from "../lib/types";
 
 interface NavItem {
   to: string;
   label: string;
   icon: LucideIcon;
   end: boolean;
-  badge?: "flags";
 }
 
 interface NavGroup {
@@ -47,7 +39,6 @@ const GROUPS: NavGroup[] = [
     items: [
       { to: "/", label: "Overview", icon: LayoutDashboard, end: true },
       { to: "/projects", label: "Projects", icon: FolderOpen, end: false },
-      { to: "/timesheets", label: "Timesheets", icon: ClipboardList, end: false },
       { to: "/search", label: "Search", icon: Search, end: false },
     ],
   },
@@ -55,9 +46,7 @@ const GROUPS: NavGroup[] = [
     label: "Operations",
     adminOnly: true,
     items: [
-      { to: "/attendance", label: "Attendance", icon: MapPin, end: false, badge: "flags" },
       { to: "/workers", label: "Workers", icon: Users, end: false },
-      { to: "/payroll", label: "Payroll", icon: Wallet, end: false },
       { to: "/projects-admin", label: "Manage", icon: Settings2, end: false },
     ],
   },
@@ -67,12 +56,8 @@ const GROUPS: NavGroup[] = [
 const ROUTE_TITLES: Array<[string, string]> = [
   ["/projects-admin", "Manage"],
   ["/projects", "Projects"],
-  ["/timesheets", "Timesheets"],
   ["/search", "Search"],
-  ["/attendance", "Attendance"],
   ["/workers", "Workers"],
-  ["/payroll", "Payroll"],
-  ["/settings", "Settings"],
 ];
 
 function routeTitle(pathname: string): string {
@@ -98,7 +83,6 @@ export function Shell() {
   const panelRef = useRef<HTMLElement>(null);
   const [drawer, setDrawer] = useState(false);
   const [pageTitle, setPageTitle] = useState<PageTitleState | null>(null);
-  const [openFlags, setOpenFlags] = useState(0);
   const [term, setTerm] = useState("");
 
   const open = compact && drawer;
@@ -115,21 +99,6 @@ export function Shell() {
   }).format(new Date());
   const groups = useMemo(() => GROUPS.filter((g) => isAdmin || !g.adminOnly), [isAdmin]);
 
-  // Attendance flags are the only review count shown in navigation.
-  useEffect(() => {
-    if (!isAdmin) return;
-    let active = true;
-    void (async () => {
-      const { data } = await supabase.rpc("overview_stats");
-      const row = (data as OverviewStats[] | null)?.[0];
-      if (!active || !row) return;
-      setOpenFlags(Number(row.open_flags));
-    })();
-    return () => {
-      active = false;
-    };
-  }, [isAdmin, location.pathname]);
-
   // A drawer that survived a navigation would cover the page it just opened.
   useEffect(() => {
     setDrawer(false);
@@ -145,10 +114,6 @@ export function Shell() {
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [open]);
-
-  function badgeFor(item: NavItem): number {
-    return item.badge === "flags" ? openFlags : 0;
-  }
 
   return (
     <>
@@ -181,20 +146,11 @@ export function Shell() {
                 <p className="side-section">{group.label}</p>
                 <div className="side-links">
                   {group.items.map((l) => {
-                    const count = badgeFor(l);
                     const Icon = l.icon;
                     return (
                       <NavLink key={l.to} to={l.to} end={l.end} className="side-link">
                         <Icon className="nav-icon" size={18} strokeWidth={1.75} aria-hidden="true" />
                         <span className="truncate">{l.label}</span>
-                        {count > 0 && (
-                          <span
-                            className="side-badge"
-                            title={`${count} open flags`}
-                          >
-                            {count}
-                          </span>
-                        )}
                       </NavLink>
                     );
                   })}
@@ -219,12 +175,6 @@ export function Shell() {
           </div>
 
           <div className="side-foot">
-            {isAdmin && (
-              <NavLink to="/settings" className="side-link">
-                <Settings className="nav-icon" size={18} strokeWidth={1.75} aria-hidden="true" />
-                <span className="truncate">Settings</span>
-              </NavLink>
-            )}
             <button className="side-link" type="button" onClick={() => void signOut()}>
               <LogOut className="nav-icon" size={18} strokeWidth={1.75} aria-hidden="true" />
               <span className="truncate">Sign out</span>
@@ -290,24 +240,6 @@ export function Shell() {
             </form>
 
             <div className="topbar-actions">
-              {isAdmin && (
-                <NavLink
-                  to="/attendance"
-                  className="icon-btn round"
-                  aria-label={
-                    openFlags > 0
-                      ? `Attendance flags — ${openFlags} open`
-                      : "Attendance flags"
-                  }
-                  title={
-                    openFlags > 0
-                      ? `${openFlags} attendance flags open`
-                      : "No attendance flags open"
-                  }
-                >
-                  <Bell size={18} strokeWidth={1.75} aria-hidden="true" />
-                </NavLink>
-              )}
               <span className="user-chip">
                 <span className="avatar" aria-hidden="true">
                   {initialsOf(name)}

@@ -3,7 +3,7 @@
 -- Run in the Supabase SQL editor when you're ready to go live.
 --
 -- Keeps: dashboard logins (profiles/auth users), settings, bot secrets.
--- Removes: seeded projects, workers, reports, media rows, attendance,
+-- Removes: seeded projects, workers, reports, media rows, notes, briefings,
 --          chat sessions.
 --
 -- IMPORTANT: run scripts/purge_storage.py afterwards (or delete the
@@ -15,20 +15,21 @@ begin;
 
 delete from public.report_media;
 delete from public.reports;
-delete from public.attendance;
 delete from public.pending_media;
 delete from public.chat_sessions;
 delete from public.project_workers;
 delete from public.group_links;
 delete from public.workers;
 delete from public.projects;
+-- Briefings describe the rows above; keeping them would leave the dashboard
+-- summarising sites that no longer exist.
+delete from public.site_summaries;
 
 -- Identity counters restart so real data begins at 1.
 alter sequence if exists projects_id_seq restart with 1;
 alter sequence if exists workers_id_seq restart with 1;
 alter sequence if exists reports_id_seq restart with 1;
 alter sequence if exists report_media_id_seq restart with 1;
-alter sequence if exists attendance_id_seq restart with 1;
 
 commit;
 
@@ -36,4 +37,5 @@ commit;
 -- insert into public.projects (code, name, site_address)
 -- values ('ABC-01', 'Actual Site Name', '12 Real Road');
 --
--- Workers add themselves by messaging the bot; approve them in Dashboard → Workers.
+-- Workers are added in Dashboard → Workers with their Telegram username; the
+-- bot never creates one.

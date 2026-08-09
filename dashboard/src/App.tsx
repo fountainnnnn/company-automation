@@ -16,24 +16,12 @@ const ProjectsPage = lazy(() =>
 const GalleryPage = lazy(() =>
   import("./pages/Gallery").then((m) => ({ default: m.GalleryPage })),
 );
-const TimesheetsPage = lazy(() =>
-  import("./pages/Timesheets").then((m) => ({ default: m.TimesheetsPage })),
-);
 const SearchPage = lazy(() => import("./pages/Search").then((m) => ({ default: m.SearchPage })));
-const AttendancePage = lazy(() =>
-  import("./pages/Attendance").then((m) => ({ default: m.AttendancePage })),
-);
-const PayrollPage = lazy(() =>
-  import("./pages/Payroll").then((m) => ({ default: m.PayrollPage })),
-);
 const WorkersPage = lazy(() =>
   import("./pages/Workers").then((m) => ({ default: m.WorkersPage })),
 );
 const ProjectsAdminPage = lazy(() =>
   import("./pages/ProjectsAdmin").then((m) => ({ default: m.ProjectsAdminPage })),
-);
-const SettingsPage = lazy(() =>
-  import("./pages/Settings").then((m) => ({ default: m.SettingsPage })),
 );
 
 function Booting() {
@@ -71,8 +59,8 @@ function AdminGate() {
       </span>
       <h2>Admin access required</h2>
       <p>
-        You're signed in as staff, so this area is off limits — attendance,
-        worker approvals and settings are admin-only. Ask an administrator if
+        You're signed in as staff, so this area is off limits — worker
+        approvals and site management are admin-only. Ask an administrator if
         you need something from here.
       </p>
       <Link className="btn btn-primary" to="/projects">
@@ -99,24 +87,7 @@ export default function App() {
               <Route index element={<OverviewPage />} />
               <Route path="projects" element={<ProjectsPage />} />
               <Route path="projects/:id" element={<GalleryPage />} />
-              <Route path="timesheets" element={<TimesheetsPage />} />
               <Route path="search" element={<SearchPage />} />
-              <Route
-                path="attendance"
-                element={
-                  <RequireAdmin>
-                    <AttendancePage />
-                  </RequireAdmin>
-                }
-              />
-              <Route
-                path="payroll"
-                element={
-                  <RequireAdmin>
-                    <PayrollPage />
-                  </RequireAdmin>
-                }
-              />
               <Route
                 path="workers"
                 element={
@@ -130,14 +101,6 @@ export default function App() {
                 element={
                   <RequireAdmin>
                     <ProjectsAdminPage />
-                  </RequireAdmin>
-                }
-              />
-              <Route
-                path="settings"
-                element={
-                  <RequireAdmin>
-                    <SettingsPage />
                   </RequireAdmin>
                 }
               />

@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { Button } from "./Button";
 import { ConfirmDialog, Modal } from "./Modal";
-import { Lightbox } from "./Lightbox";
+import { Lightbox, isImage } from "./Lightbox";
 import type { LightboxItem } from "./Lightbox";
 import { StatusChip } from "./StatusChip";
 import { useToast } from "./Toast";
@@ -208,7 +208,7 @@ export function ReportCard({
                 aria-label={`Open ${m.media_type}: ${name}`}
                 title={name}
               >
-                {m.media_type === "photo" && url ? (
+                {isImage(m) && url ? (
                   <img src={url} alt={alt} loading="lazy" decoding="async" />
                 ) : (
                   <span className="file-tile">

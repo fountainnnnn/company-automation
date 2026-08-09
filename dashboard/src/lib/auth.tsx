@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type { Session } from "@supabase/supabase-js";
 import { supabase } from "./supabase";
@@ -30,13 +30,33 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [loading, setLoading] = useState(true);
 
+  /** Which user the loaded profile belongs to, so we fetch once per identity. */
+  const loadedFor = useRef<string | null>(null);
+
   useEffect(() => {
     let active = true;
+
+    /**
+     * Fetch a profile at most once per user. Supabase re-fires auth events on
+     * token refresh and on tab focus with the *same* user; refetching then meant
+     * a new profile object every time, which churned the context value for every
+     * consumer — and because loadProfile returns null on any transient failure,
+     * one blip blanked `isAdmin` and the sidebar dropped its admin section.
+     * A failure leaves the previous profile in place and allows a later retry.
+     */
+    async function syncProfile(userId: string) {
+      if (loadedFor.current === userId) return;
+      loadedFor.current = userId;
+      const p = await loadProfile(userId);
+      if (!active) return;
+      if (p) setProfile(p);
+      else loadedFor.current = null;
+    }
 
     supabase.auth.getSession().then(async ({ data }) => {
       if (!active) return;
       setSession(data.session);
-      if (data.session) setProfile(await loadProfile(data.session.user.id));
+      if (data.session) await syncProfile(data.session.user.id);
       if (active) setLoading(false);
     });
 
@@ -44,12 +64,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (!active) return;
       setSession(next);
       if (!next) {
+        loadedFor.current = null;
         setProfile(null);
         return;
       }
-      void loadProfile(next.user.id).then((p) => {
-        if (active) setProfile(p);
-      });
+      void syncProfile(next.user.id);
     });
 
     return () => {
