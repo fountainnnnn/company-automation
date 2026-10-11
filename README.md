@@ -13,7 +13,7 @@ across sites and teams, regenerated on a schedule.
 Roster capture, pay calculation and GPS attendance were all removed in August 2026. What
 remains is the archive and the reading of it.
 
-**Status: live.** Webhook registered, schema deployed, dashboard built and tested.
+**Status: demo.** A portfolio project with fake sites, workers, photos and documents. It is not used by a real company.
 
 ## The pieces
 
@@ -23,12 +23,12 @@ remains is the archive and the reading of it.
 | Focus briefing | Supabase Edge Function `site-summary` | Server-side model call; key in `app_secrets`, cached, `pg_cron` every 2h |
 | Database + storage | Supabase `odsofzzjniafttbdhtye` (ap-northeast-1) | Postgres + private `site-media` bucket; full RLS |
 | Dashboard | `dashboard/` (Vite + React + TS) | `npm run dev` locally · `npm run build` for deploy |
-| Migrations | `supabase/migrations/*.sql` | Already applied to the live project |
+| Migrations | `supabase/migrations/*.sql` | Applied to the demo Supabase project |
 | Test harness | `scripts/tg_update.py` | Drives the real webhook with synthetic Telegram updates |
 
 ## Logins & secrets
 
-See [docs/CREDENTIALS.md](docs/CREDENTIALS.md) (admin + staff dashboard logins).
+**Demo login:** the shared admin and staff logins are in [docs/CREDENTIALS.md](docs/CREDENTIALS.md). They are public on purpose so anyone can try the dashboard; all the data behind them is fake.
 Bot token + webhook secret live in the `app_secrets` table (service-role only).
 Rotate the token via @BotFather `/revoke` → update the `telegram_bot_token` row → re-run `setWebhook`.
 

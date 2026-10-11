@@ -1,4 +1,6 @@
-# Credentials (local only — do NOT commit to any public repo)
+# Demo logins
+
+These logins are public on purpose so anyone can try the dashboard. Every site, worker, photo and document behind them is fake demo data.
 
 ## Dashboard logins (Supabase Auth)
 | Role | Email | Password |
@@ -6,7 +8,6 @@
 | Admin | `admin@clautomation.local` | `vos2h1O2dVAIpHcK` |
 | Staff | `staff@clautomation.local` | `Ws1ynCqLtuFo9esT` |
 
-Change these after first login (or ask Claude to rotate them).
 
 ## Supabase
 - Project: `automation` (`odsofzzjniafttbdhtye`) — https://odsofzzjniafttbdhtye.supabase.co
